@@ -18,7 +18,7 @@ allow = [
     "CC0-1.0",
     "OpenSSL",
 ]
-unused-allowed-licenses = "allow"
+unused-allowed-license = "allow"
 
 [bans]
 # Warn (not deny) on duplicate dependencies — some are unavoidable in the PyO3 tree.

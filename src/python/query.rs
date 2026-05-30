@@ -323,9 +323,10 @@ impl PyQuery {
     ///
     /// Raises ``ValueError`` if any element cannot be converted to float.
     ///
-    /// Example::
-    ///
-    ///     Query.f64([1, 2, 3.0]).filter(col > 1).to_list()  # → [2.0, 3.0]
+    /// Example:
+    /// ```python
+    /// Query.f64([1, 2, 3.0]).filter(col > 1).to_list()  # → [2.0, 3.0]
+    /// ```
     #[staticmethod]
     fn f64(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Self> {
         let list = data.iter()?;
@@ -349,9 +350,10 @@ impl PyQuery {
     ///
     /// Raises ``ValueError`` if any element cannot be converted to int.
     ///
-    /// Example::
-    ///
-    ///     Query.i64([1, 2, 3]).filter(col > 1).to_list()  # → [2, 3]
+    /// Example:
+    /// ```python
+    /// Query.i64([1, 2, 3]).filter(col > 1).to_list()  # → [2, 3]
+    /// ```
     #[staticmethod]
     fn i64(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Self> {
         let list = data.iter()?;

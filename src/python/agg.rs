@@ -21,14 +21,15 @@ pub(crate) enum GroupKey {
 
 /// Python-facing aggregation specification for `Query.group_agg()`.
 ///
-/// Use the static constructors::
-///
-///     from zpyflow import Query, AggSpec
-///     result = Query(data).group_agg(
-///         lambda p: p["category"],
-///         ["count", "revenue"],
-///         [AggSpec.count(), AggSpec.sum(lambda p: p["price"])],
-///     )
+/// Use the static constructors:
+/// ```python
+/// from zpyflow import Query, AggSpec
+/// result = Query(data).group_agg(
+///     lambda p: p["category"],
+///     ["count", "revenue"],
+///     [AggSpec.count(), AggSpec.sum(lambda p: p["price"])],
+/// )
+/// ```
 #[pyclass(name = "AggSpec")]
 pub struct PyAggSpec {
     pub(crate) kind: AggSpecKind,
