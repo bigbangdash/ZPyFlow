@@ -1,0 +1,51 @@
+[package]
+name = "zpyflow"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-allocation lazy query pipelines for Python, powered by Rust"
+license = "MIT"
+authors = ["ZPyFlow Contributors"]
+keywords = ["python", "query", "pipeline", "simd", "pyo3"]
+categories = ["science", "data-structures", "algorithms"]
+
+[lib]
+name = "_zpyflow"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+simd    = []       # Requires nightly (portable_simd); stable uses wide
+arrow   = []  # reserved feature flag — arrow2 removed (RUSTSEC-2025-0038, no fix available)
+
+[dependencies]
+pyo3        = { version = "0.21", features = ["extension-module", "abi3-py310"] }
+numpy       = { version = "0.21" }
+rayon       = { version = "1.9", optional = true }
+wide        = "0.7"     # Stable portable SIMD - f64x4, f32x8, i64x4, etc.
+num-traits  = "0.2"
+csv         = "1.3"
+serde_json  = { version = "1.0", features = ["preserve_order"] }
+ahash       = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+pyo3      = { version = "0.21", features = ["auto-initialize"] }
+
+[[bench]]
+name    = "pipeline"
+harness = false
+
+[[bench]]
+name    = "simd_filter"
+harness = false
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+
+[profile.bench]
+inherits      = "release"
+debug         = true    # Keep symbols for profiling

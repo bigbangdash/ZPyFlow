@@ -1,0 +1,127 @@
+name: zpyflow
+
+# ── Shared configuration ────────────────────────────────────────────────────
+# All services share ONE image (zpyflow-dev).
+# Build the image explicitly with `make dc-image` (or `docker compose build`).
+# Do NOT pass --build to `docker compose run` — that would create a separate
+# tagged image per service and leave dangling <none>:<none> images over time.
+#
+# Named volumes keep Cargo artifacts and registry between runs, so the second
+# `docker compose run test` is as fast as a local rebuild.
+x-base: &base
+  image: zpyflow-dev
+  volumes:
+    # Source code (bind mount — edits on host appear instantly)
+    - .:/app
+    # Cargo package cache (registry + git checkouts)
+    - cargo-registry:/usr/local/cargo/registry
+    - cargo-git:/usr/local/cargo/git
+    # Compiled Rust artifacts — persists across container restarts.
+    # Mounted OVER /app/target so the host directory is shadowed.
+    - target:/app/target
+    # Benchmark results on the host
+    - ./sandbox/benchmark/results:/app/sandbox/benchmark/results
+  working_dir: /app
+
+
+services:
+
+  # ── Image build ────────────────────────────────────────────────────────────
+  # Builds and tags the shared image as zpyflow-dev.
+  # Run via `make dc-image` (or `docker compose build dev`) after changing
+  # docker/Dockerfile or docker/requirements-dev.txt.
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: zpyflow-dev
+    command: echo "zpyflow-dev image ready"
+
+  # ── Build only ─────────────────────────────────────────────────────────────
+  build:
+    <<: *base
+    command: >
+      sh -c "maturin develop --release 2>&1"
+
+  # ── Python unit tests ──────────────────────────────────────────────────────
+  #   docker compose run --rm test
+  #   docker compose run --rm test pytest tests/test_basic.py -v -k "f64"
+  test:
+    <<: *base
+    command: >
+      sh -c "
+        maturin develop --release &&
+        pytest tests/ -v --tb=short
+      "
+
+  # ── All Python benchmarks ──────────────────────────────────────────────────
+  #   docker compose run --rm bench
+  bench:
+    <<: *base
+    command: >
+      sh -c "
+        maturin develop --release &&
+        python sandbox/benchmark/run.py --suite all --config default
+      "
+
+  # ── Single benchmark suite (override with SUITE env var) ──────────────────
+  #   docker compose run --rm bench-suite
+  #   SUITE=chained docker compose run --rm bench-suite
+  bench-suite:
+    <<: *base
+    environment:
+      SUITE: ${SUITE:-filter}
+    command: >
+      sh -c "
+        maturin develop --release &&
+        python sandbox/benchmark/run.py --suite $${SUITE} --config default
+      "
+
+  # ── Rust (Criterion) benchmarks ────────────────────────────────────────────
+  #   docker compose run --rm bench-rust
+  bench-rust:
+    <<: *base
+    command: cargo bench --bench pipeline -- --output-format html
+
+  # ── Compare benchmark against saved baseline ───────────────────────────────
+  bench-save:
+    <<: *base
+    environment:
+      SUITE: ${SUITE:-filter}
+    command: >
+      sh -c "
+        maturin develop --release &&
+        python sandbox/benchmark/run.py --suite $${SUITE} --save
+      "
+
+  bench-compare:
+    <<: *base
+    environment:
+      SUITE: ${SUITE:-filter}
+    command: >
+      sh -c "
+        maturin develop --release &&
+        python sandbox/benchmark/run.py --suite $${SUITE} --compare
+      "
+
+  # ── Interactive development shell ──────────────────────────────────────────
+  #   docker compose run --rm shell
+  shell:
+    <<: *base
+    stdin_open: true
+    tty: true
+    command: >
+      sh -c "
+        maturin develop --release &&
+        bash
+      "
+
+
+# ── Named volumes ───────────────────────────────────────────────────────────
+volumes:
+  cargo-registry:
+    driver: local
+  cargo-git:
+    driver: local
+  target:
+    driver: local

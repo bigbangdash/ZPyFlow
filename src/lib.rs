@@ -1,0 +1,34 @@
+//! ZPyFlow — Rust core for high-performance lazy Python query pipelines.
+//!
+//! This crate is compiled as a Python extension module (`cdylib`) via PyO3.
+//! It exposes:
+//!
+//!   - `Query`     — lazy pipeline builder
+//!   - `col`       — expression proxy for the expression DSL
+//!   - `Expr`      — expression type (result of `col > 5`, `col * 2`, etc.)
+//!
+//! All other types (`ZStream`, `NumericPipeline`, etc.) are Rust-internal.
+
+pub mod io;
+pub mod parallel;
+pub mod pipeline;
+pub mod python;
+pub mod simd;
+
+use pyo3::prelude::*;
+use python::{field, PyAggSpec, PyColProxy, PyExpr, PyFieldExpr, PyQuery};
+
+#[pymodule]
+fn _zpyflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyQuery>()?;
+    m.add_class::<PyExpr>()?;
+    m.add_class::<PyColProxy>()?;
+    m.add_class::<PyAggSpec>()?;
+    m.add_class::<PyFieldExpr>()?;
+    m.add_function(wrap_pyfunction!(field, m)?)?;
+
+    m.add("col", PyColProxy {})?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
+    Ok(())
+}

@@ -1,0 +1,63 @@
+[build-system]
+requires      = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "zpyflow"
+version         = "0.1.0"
+description     = "Zero-allocation lazy query pipelines for Python, powered by Rust"
+readme          = "README.md"
+license         = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors         = [{ name = "bigbangdash" }]
+keywords        = ["query", "pipeline", "rust", "simd", "lazy", "etl"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage      = "https://github.com/bigbangdash/zpyflow"
+Repository    = "https://github.com/bigbangdash/zpyflow"
+Documentation = "https://bigbangdash.github.io/zpyflow"
+"Bug Tracker" = "https://github.com/bigbangdash/zpyflow/issues"
+
+[project.optional-dependencies]
+numpy  = ["numpy>=1.21"]
+arrow  = ["pyarrow>=12.0"]
+dev    = [
+    "maturin>=1.5",
+    "pytest>=7",
+    "pytest-benchmark>=4",
+    "numpy>=1.21",
+    "pyarrow>=12.0",
+    "pandas>=2.0",
+    "polars>=0.19",
+    "memory-profiler>=0.61",
+]
+
+[tool.maturin]
+features          = ["pyo3/extension-module"]
+python-source     = "."
+module-name       = "zpyflow._zpyflow"
+# Strip debug symbols in release builds for smaller wheel
+strip             = true
+# Generate .pyi stubs from Rust docstrings (optional, requires maturin>=1.5)
+# bindings-pyi = true
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+filterwarnings = ["error"]
+
+[tool.mypy]
+files            = ["zpyflow"]
+strict           = true
+ignore_missing_imports = true

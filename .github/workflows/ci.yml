@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Rust unit tests ────────────────────────────────────────────────────────
+  rust-test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  # ── Dependency audit ───────────────────────────────────────────────────────
+  cargo-deny:
+    name: cargo-deny audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          # advisories: deny; licenses / bans: warn until deny.toml is tuned
+          command: check advisories
+
+  # ── Miri UB checks (pure-Rust pipeline logic only) ───────────────────────
+  miri:
+    name: Miri UB check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-nightly
+      - name: Run Miri on pure-Rust pipeline tests
+        # Only the pipeline and simd modules — PyO3 FFI is not Miri-compatible.
+        run: cargo +nightly miri test --lib -- pipeline simd
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  # ── Python + Rust integration tests ───────────────────────────────────────
+  pytest:
+    name: pytest (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build dependencies
+        run: pip install maturin numpy pyarrow
+      - name: Build and install extension
+        run: maturin develop --release
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run tests
+        run: pytest tests/ -v

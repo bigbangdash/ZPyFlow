@@ -1,0 +1,39 @@
+name: Benchmark Regression
+
+on:
+  # Run manually to compare against a pinned baseline
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Benchmark suite to run"
+        required: false
+        default: "filter"
+        type: choice
+        options: [filter, chained, aggregation, vs_numpy, objects]
+  # Optionally enable on PRs (disabled by default — too noisy in CI)
+  # pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bench-regression:
+    name: Benchmark regression check (${{ inputs.suite || 'filter' }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install maturin numpy pyarrow pandas polars pytest pytest-benchmark
+      - name: Build extension
+        run: maturin develop --release
+      - name: Run benchmark suite
+        env:
+          SUITE: ${{ inputs.suite || 'filter' }}
+        working-directory: sandbox/benchmark
+        run: |
+          python run.py --suite "$SUITE" --config quick --compare

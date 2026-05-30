@@ -1,0 +1,75 @@
+# Rust
+target/
+# Cargo.lock is intentionally committed for reproducible builds
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[codz]
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pypirc
+
+# Maturin / PyO3
+*.whl
+zpyflow/_zpyflow*.so
+zpyflow/_zpyflow*.pyd
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Benchmarks
+sandbox/benchmark/results/
+
+docs/ja/
+
+# Internal development docs
+specs/
+CLAUDE.md
+Cargo.toml.bak
+
+# Docs build output (mkdocs)
+/site
+site/site/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+__MACOSX/
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+.\#*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

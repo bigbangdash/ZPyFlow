@@ -1,0 +1,10 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0020: pyo3 0.21.2 — PyString::from_object buffer overflow
+    # ZPyFlow does NOT call PyString::from_object anywhere in src/.
+    # All string construction goes through PyString::new_bound.
+    # Upgrading to pyo3 >=0.24.1 requires non-trivial Clone refactor across
+    # agg.rs and query.rs (Py<PyAny> no longer implements Clone in 0.24).
+    # Accepting known risk: the vulnerable code path is never reached.
+    "RUSTSEC-2025-0020",
+]

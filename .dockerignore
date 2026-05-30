@@ -1,0 +1,36 @@
+# ── Rust build artifacts ────────────────────────────────────────────────────
+target/
+
+# ── Python artifacts ────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Test / benchmark output ─────────────────────────────────────────────────
+.pytest_cache/
+sandbox/benchmark/results/*.json
+sandbox/benchmark/results/*.csv
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# ── Git ──────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Docker itself ────────────────────────────────────────────────────────────
+docker-compose*.yml
+docker/

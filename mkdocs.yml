@@ -1,0 +1,53 @@
+site_name: ZPyFlow
+site_description: Zero-allocation lazy query pipelines for Python, powered by Rust
+site_url: https://bigbangdash.github.io/zpyflow
+repo_url: https://github.com/bigbangdash/zpyflow
+repo_name: bigbangdash/zpyflow
+edit_uri: edit/main/site/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - API Reference: api.md
+  - Performance Guide: performance.md
+  - Examples:
+      - Overview: examples/index.md
+      - Numeric DSL: examples/numeric.md
+      - NumPy Integration: examples/numpy.md
+      - Object Field DSL: examples/field_dsl.md
+      - GroupBy & group_agg: examples/groupby.md
+      - Adapters: examples/adapters.md
+  - Benchmark Results: benchmarks.md
+  - Design Notes: design.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
