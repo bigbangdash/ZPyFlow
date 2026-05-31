@@ -42,8 +42,7 @@ specs/
 CLAUDE.md
 Cargo.toml.bak
 
-# Docs build output (mkdocs)
-/site
+# Docs build output (mkdocs) — site/docs/ is source, site/site/ is build output
 site/site/
 
 # macOS
