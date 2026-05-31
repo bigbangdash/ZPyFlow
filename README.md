@@ -31,14 +31,7 @@ pip install zpyflow[numpy]   # NumPy integration
 pip install zpyflow[arrow]   # PyArrow integration
 ```
 
-### Development install (from source)
-
-```bash
-pip install maturin
-git clone https://github.com/bigbangdash/zpyflow
-cd zpyflow
-maturin develop --release
-```
+To build from source, see [docs/contributing.md](docs/contributing.md).
 
 ---
 
