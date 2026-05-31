@@ -39,7 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
 
@@ -78,7 +79,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install maturin numpy pyarrow pytest
+        run: pip install maturin numpy pyarrow pytest pytest-benchmark
       - name: Build and install extension
         run: |
           maturin build --release
@@ -113,7 +114,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install maturin numpy pyarrow pytest
+        run: pip install maturin numpy pyarrow pytest pytest-benchmark
       - name: Build and install extension
         run: |
           maturin build --release
