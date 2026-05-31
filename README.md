@@ -3,13 +3,19 @@
 > **⚠ Alpha — v0.1.0 is an early release for testing and feedback.**
 > APIs may change before v1.0. Not recommended for production use without pinning the version.
 
-Zero-allocation lazy query pipelines for Python, powered by Rust.
+Lazy query pipelines for Python, powered by Rust — with **zero unnecessary allocations**.
 
 - **Lazy & fused** — filter + map + take run in a single pass with no intermediate lists
 - **SIMD-accelerated** — float/int arrays execute in Rust with the GIL released, using `f64x4`
 - **Expression DSL** — `col > 5` eliminates Python callbacks entirely
 - **Python-friendly** — numpy, pandas, dataclasses, plain lists, and generators all work as input
 - **Parallel execution** — `.parallel()` enables Rayon work-stealing
+
+> **What "zero unnecessary allocations" means**: chaining `filter → map → take` creates no
+> intermediate Python lists or arrays. Scalar terminals (`count`, `sum`, `max`) stay entirely
+> in Rust with no heap allocation. Collection terminals (`to_list`) allocate only the final
+> output — compared to Python list comprehensions (one intermediate list per operation) or
+> NumPy boolean indexing (mask array + result array + Python list).
 
 > **ZPyFlow is not a DataFrame engine.**
 > It lets Python sequence hot paths — `list[float]`, numpy arrays, dict record streams —
