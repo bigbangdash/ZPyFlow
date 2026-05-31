@@ -5,6 +5,7 @@ repo_url: https://github.com/bigbangdash/zpyflow
 repo_name: bigbangdash/zpyflow
 edit_uri: edit/main/site/docs/
 docs_dir: site/docs
+site_dir: _site
 
 theme:
   name: material
