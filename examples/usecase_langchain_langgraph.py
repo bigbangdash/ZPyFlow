@@ -1,209 +1,212 @@
 """
 usecase_langchain_langgraph.py
 ------------------------------
-Industry: AI / LLM applications (RAG, agents, pipelines).
+An AI agent that analyzes transaction data using ZPyFlow as tools,
+backed by OpenAI / Anthropic / Google Gemini (whichever key is set).
 
-ZPyFlow slots into LangChain and LangGraph wherever a node processes
-large numeric arrays — similarity scores, confidence values, logprobs, etc.
+ZPyFlow is used inside LangChain tools for fast numeric processing:
+  - filter transactions by amount / risk score
+  - compute aggregate stats without materializing full Python lists
+  - early-stopping top-K retrieval
 
-No special integration is needed: ZPyFlow is just called inside your
-node functions or tools.  The examples below mock the LangChain/LangGraph
-types so they run standalone without those libraries installed.
+Setup — set at least one API key:
+    export OPENAI_API_KEY="sk-..."
+    export ANTHROPIC_API_KEY="sk-ant-..."
+    export GOOGLE_API_KEY="AIza..."
 
-Patterns shown:
-  1. RAG retriever  — threshold filter + early stopping on similarity scores
-  2. LangGraph node — aggregate a large score array without list materialization
-  3. LangChain tool — return pre-aggregated stats to the LLM
-  4. Batch scoring  — per-batch stats over a streamed inference pipeline
+Run:
+    python examples/usecase_langchain_langgraph.py
+
+Dependencies:
+    pip install langchain langgraph langchain-openai \
+                langchain-anthropic langchain-google-genai numpy zpyflow
 """
 
 from __future__ import annotations
 
-import math
+import os
 import random
-import time
-from typing import Any
+import math
+from typing import Annotated, Any
 
 import numpy as np
 from zpyflow import Query, col, from_numpy
 
+# ── LangChain / LangGraph imports ──────────────────────────────────────────
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from langgraph.graph import StateGraph, MessagesState, END
+from langgraph.prebuilt import ToolNode
+
+# ---------------------------------------------------------------------------
+# 1. Pick LLM provider based on available API keys
+# ---------------------------------------------------------------------------
+
+def get_llm():
+    if os.getenv("ANTHROPIC_API_KEY"):
+        from langchain_anthropic import ChatAnthropic
+        print("Using Claude (Anthropic)")
+        return ChatAnthropic(model="claude-3-5-haiku-20241022", max_tokens=1024)
+
+    if os.getenv("OPENAI_API_KEY"):
+        from langchain_openai import ChatOpenAI
+        print("Using GPT-4o-mini (OpenAI)")
+        return ChatOpenAI(model="gpt-4o-mini", max_tokens=1024)
+
+    if os.getenv("GOOGLE_API_KEY"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        print("Using Gemini Flash (Google)")
+        return ChatGoogleGenerativeAI(model="gemini-1.5-flash", max_tokens=1024)
+
+    raise EnvironmentError(
+        "No API key found. Set one of:\n"
+        "  ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY"
+    )
+
+# ---------------------------------------------------------------------------
+# 2. Generate mock transaction dataset (simulates a live data source)
+# ---------------------------------------------------------------------------
+
 rng = random.Random(42)
 np_rng = np.random.default_rng(42)
 
-# ---------------------------------------------------------------------------
-# Mock helpers (replace with real LangChain/LangGraph objects in production)
-# ---------------------------------------------------------------------------
+N_TRANSACTIONS = 500_000
 
-class MockDocument:
-    def __init__(self, content: str, doc_id: int):
-        self.page_content = content
-        self.metadata = {"id": doc_id}
+print(f"Generating {N_TRANSACTIONS:,} mock transactions...")
 
-    def __repr__(self) -> str:
-        return f"Document(id={self.metadata['id']}, content={self.page_content[:30]!r})"
-
-
-def mock_embed(texts: list[str]) -> np.ndarray:
-    """Returns random unit vectors — stand-in for a real embedding model."""
-    vecs = np_rng.standard_normal((len(texts), 128)).astype(np.float32)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    return vecs / norms
-
-
-def cosine_scores(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
-    return (doc_vecs @ query_vec).astype(np.float64)
-
-
-# ---------------------------------------------------------------------------
-# Case 1 — RAG retriever: threshold filter + early stopping
-# ---------------------------------------------------------------------------
-
-N_DOCS = 500_000
-RETRIEVAL_THRESHOLD = 0.6
-TOP_K = 20
-
-print(f"Case 1 — RAG retriever ({N_DOCS:,} documents):")
-
-docs = [MockDocument(f"doc content {i}", i) for i in range(N_DOCS)]
-
-# Simulate realistic similarity score distribution:
-# most docs are low-relevance (beta skewed toward 0), a few are highly relevant
-scores = np_rng.beta(1.5, 8, N_DOCS).astype(np.float64)
-# Inject ~50 highly relevant docs near the query
-hot_idx = np_rng.choice(N_DOCS, size=50, replace=False)
-scores[hot_idx] = np_rng.uniform(0.65, 0.95, size=50)
-
-t0 = time.perf_counter()
-
-# ZPyFlow: SIMD filter + early stopping — never scans beyond the K-th hit
-top_indices = (
-    from_numpy(scores)
-    .filter(col > RETRIEVAL_THRESHOLD)
-    .take(TOP_K)
-    .to_list()
-)
-
-ms = (time.perf_counter() - t0) * 1000
-retrieved = [docs[int(i)] for i in top_indices]
-
-print(f"  Retrieved {len(retrieved)} docs above threshold={RETRIEVAL_THRESHOLD}")
-print(f"  Time: {ms:.2f}ms  (early stopping — did not scan all {N_DOCS:,})")
-print()
-
-# ---------------------------------------------------------------------------
-# Case 2 — LangGraph node: aggregate score array without materializing a list
-# ---------------------------------------------------------------------------
-
-print("Case 2 — LangGraph node (score aggregation):")
-
-
-def score_filter_node(state: dict[str, Any]) -> dict[str, Any]:
-    """
-    LangGraph node that receives a large score array and returns summary stats.
-    All aggregations stay inside Rust — no Python list is created.
-
-    In a real LangGraph graph:
-        graph.add_node("score_filter", score_filter_node)
-    """
-    scores: list[float] = state["candidate_scores"]
-    q = Query(scores)
-    n = q.count()
-    return {
-        "total_candidates": n,
-        "high_quality":     q.filter(col > 0.85).count(),
-        "low_quality":      q.filter(col < 0.5).count(),
-        "best_score":       round(q.max(), 4),
-        "mean_score":       round(q.sum() / n, 4) if n else 0.0,
+transactions = [
+    {
+        "id":         i,
+        "amount":     round(math.exp(rng.gauss(4.5, 1.5)), 2),   # log-normal
+        "risk_score": float(np_rng.beta(1.5, 8)),                 # mostly low
+        "category":   rng.choice(["retail", "travel", "online", "atm", "p2p"]),
+        "status":     rng.choice(["approved", "approved", "approved", "flagged", "declined"]),
     }
+    for i in range(N_TRANSACTIONS)
+]
+# Inject some high-risk transactions
+for i in range(0, N_TRANSACTIONS, 5000):
+    transactions[i]["risk_score"] = round(rng.uniform(0.75, 0.99), 3)
 
-
-N_CANDIDATES = 1_000_000
-candidate_scores = np_rng.beta(2, 5, N_CANDIDATES).tolist()  # skewed toward 0
-
-t0 = time.perf_counter()
-result = score_filter_node({"candidate_scores": candidate_scores})
-ms = (time.perf_counter() - t0) * 1000
-
-print(f"  Input: {N_CANDIDATES:,} scores")
-for k, v in result.items():
-    print(f"  {k}: {v}")
-print(f"  Time: {ms:.2f}ms")
-print()
+amounts = np.array([t["amount"] for t in transactions], dtype=np.float64)
+risk_scores = np.array([t["risk_score"] for t in transactions], dtype=np.float64)
+print("Done.\n")
 
 # ---------------------------------------------------------------------------
-# Case 3 — LangChain tool: return pre-aggregated stats to the LLM
+# 3. LangChain tools powered by ZPyFlow
 # ---------------------------------------------------------------------------
 
-print("Case 3 — LangChain tool (stats returned to LLM):")
-
-
-def analyze_search_results(scores: list[float]) -> dict[str, Any]:
+@tool
+def get_transaction_stats(threshold_amount: float = 0.0) -> dict[str, Any]:
     """
-    LangChain @tool that aggregates similarity scores.
-    The LLM receives a compact dict instead of a raw list.
-
-    In a real LangChain app:
-        @tool
-        def analyze_search_results(scores: list[float]) -> dict: ...
-        llm_with_tools = llm.bind_tools([analyze_search_results])
+    Return summary statistics for transactions above a given amount threshold.
+    Uses ZPyFlow SIMD aggregation — all ops stay in Rust, no Python list created.
     """
-    q = Query(scores)
+    q = from_numpy(amounts).filter(col > threshold_amount)
     n = q.count()
     if n == 0:
-        return {"error": "no scores provided"}
+        return {"count": 0, "message": f"No transactions above {threshold_amount}"}
     return {
-        "total":        n,
-        "high_quality": q.filter(col > 0.85).count(),
-        "low_quality":  q.filter(col < 0.5).count(),
-        "best_score":   round(q.max(), 4),
-        "mean_score":   round(q.sum() / n, 4),
+        "count":   n,
+        "total":   round(q.sum(), 2),
+        "mean":    round(q.sum() / n, 2),
+        "max":     round(q.max(), 2),
+        "min":     round(q.min(), 2),
+        "pct_of_total": round(n / N_TRANSACTIONS * 100, 2),
     }
 
 
-tool_input = np_rng.beta(2, 5, 200_000).tolist()
+@tool
+def get_high_risk_transactions(risk_threshold: float = 0.8, top_k: int = 10) -> dict[str, Any]:
+    """
+    Find transactions with risk score above the threshold.
+    Uses ZPyFlow early stopping — stops scanning once top_k are found.
+    Returns the top_k highest-risk transaction IDs and their scores.
+    """
+    # Count total flagged
+    flagged_count = from_numpy(risk_scores).filter(col > risk_threshold).count()
 
-t0 = time.perf_counter()
-tool_output = analyze_search_results(tool_input)
-ms = (time.perf_counter() - t0) * 1000
+    # Get top-K indices with early stopping
+    top_indices = (
+        from_numpy(risk_scores)
+        .filter(col > risk_threshold)
+        .take(top_k)
+        .to_list()
+    )
+    top_txns = [
+        {"id": transactions[int(i)]["id"], "risk_score": transactions[int(i)]["risk_score"]}
+        for i in top_indices
+    ]
+    return {
+        "risk_threshold":    risk_threshold,
+        "total_flagged":     flagged_count,
+        "pct_flagged":       round(flagged_count / N_TRANSACTIONS * 100, 3),
+        "sample_top_k":      top_txns,
+    }
 
-print(f"  Tool input:  {len(tool_input):,} scores")
-print(f"  Tool output: {tool_output}")
-print(f"  Time: {ms:.2f}ms")
-print()
+
+@tool
+def get_category_risk_summary() -> dict[str, Any]:
+    """
+    Compute average risk score and transaction count per category.
+    Uses ZPyFlow lambda filters on dict records.
+    """
+    categories = ["retail", "travel", "online", "atm", "p2p"]
+    summary = {}
+    for cat in categories:
+        q = Query(transactions).filter(lambda t, c=cat: t["category"] == c)
+        n = q.count()
+        if n == 0:
+            continue
+        risk_vals = [t["risk_score"] for t in transactions if t["category"] == cat]
+        avg_risk = Query(risk_vals).sum() / n
+        summary[cat] = {
+            "count":    n,
+            "avg_risk": round(avg_risk, 4),
+        }
+    return summary
 
 # ---------------------------------------------------------------------------
-# Case 4 — Batch scoring pipeline: per-batch stats over a streamed source
+# 4. LangGraph agent
 # ---------------------------------------------------------------------------
 
-print("Case 4 — Batch scoring pipeline (streaming simulation):")
-
-TOTAL = 2_000_000
-BATCH_SIZE = 50_000
-
-
-def score_stream(total: int, batch_size: int):
-    """Simulate a stream of inference batches (e.g. from a model server)."""
-    for start in range(0, total, batch_size):
-        size = min(batch_size, total - start)
-        yield np_rng.beta(2, 5, size).tolist()
+tools = [get_transaction_stats, get_high_risk_transactions, get_category_risk_summary]
+llm = get_llm()
+llm_with_tools = llm.bind_tools(tools)
 
 
-t0 = time.perf_counter()
-batch_stats = []
-for batch in score_stream(TOTAL, BATCH_SIZE):
-    q = Query(batch)
-    n = q.count()
-    batch_stats.append({
-        "n":          n,
-        "high_conf":  q.filter(col > 0.85).count(),
-        "mean":       round(q.sum() / n, 4),
-    })
+def call_llm(state: MessagesState):
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
-ms = (time.perf_counter() - t0) * 1000
-total_high = sum(b["high_conf"] for b in batch_stats)
 
-print(f"  {len(batch_stats)} batches × {BATCH_SIZE:,} = {TOTAL:,} total scores")
-print(f"  High-confidence (>0.85): {total_high:,} "
-      f"({total_high/TOTAL*100:.1f}%)")
-print(f"  Mean per batch: {sum(b['mean'] for b in batch_stats)/len(batch_stats):.4f}")
-print(f"  Total time: {ms:.2f}ms")
+def should_continue(state: MessagesState):
+    last = state["messages"][-1]
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "tools"
+    return END
+
+
+graph = StateGraph(MessagesState)
+graph.add_node("llm", call_llm)
+graph.add_node("tools", ToolNode(tools))
+graph.set_entry_point("llm")
+graph.add_conditional_edges("llm", should_continue)
+graph.add_edge("tools", "llm")
+app = graph.compile()
+
+# ---------------------------------------------------------------------------
+# 5. Run example queries
+# ---------------------------------------------------------------------------
+
+queries = [
+    "How many transactions are above $1,000? What's the total value?",
+    "Find high-risk transactions with a risk score above 0.85. How many are there?",
+    "Which transaction category has the highest average risk score?",
+]
+
+for query in queries:
+    print(f"Q: {query}")
+    result = app.invoke({"messages": [HumanMessage(content=query)]})
+    answer = result["messages"][-1].content
+    print(f"A: {answer}")
+    print()
