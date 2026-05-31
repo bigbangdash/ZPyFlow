@@ -1,5 +1,8 @@
 # ZPyFlow
 
+> **⚠ Alpha — v0.1.0 is an early release for testing and feedback.**
+> APIs may change before v1.0. Not recommended for production use without pinning the version.
+
 Zero-allocation lazy query pipelines for Python, powered by Rust.
 
 - **Lazy & fused** — filter + map + take run in a single pass with no intermediate lists
