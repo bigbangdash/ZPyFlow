@@ -6,14 +6,20 @@ on:
     paths-ignore:
       - "docs/**"
       - "site/**"
+      - "examples/**"
+      - "sandbox/**"
       - "**.md"
       - "mkdocs.yml"
+      - "LICENSE"
   pull_request:
     paths-ignore:
       - "docs/**"
       - "site/**"
+      - "examples/**"
+      - "sandbox/**"
       - "**.md"
       - "mkdocs.yml"
+      - "LICENSE"
   workflow_dispatch:
     inputs:
       run_quick:
