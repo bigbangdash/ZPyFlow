@@ -104,40 +104,38 @@ impl Drop for RawBuffer {
 // so ob_fval never changes after allocation.
 // ---------------------------------------------------------------------------
 
-/// Extract f64 from a Python object without ever setting an exception.
+/// Extract f64 from a Python object, returning NaN for non-float elements.
 ///
-/// - PyFloat → reads ob_fval directly via PyFloat_AsDouble (fast, no exception)
-/// - non-float (e.g. None, int, str) → returns NaN without touching exception state
+/// Calls `PyFloat_AsDouble`; for non-float objects (e.g. None) it returns -1.0
+/// and sets a TypeError. We call `PyErr_Clear()` both before (defensive) and
+/// after detecting the error, ensuring the interpreter exception state is clean
+/// regardless of platform or Python version.
 ///
-/// This is the key fix for spec-048: `PyFloat_AsDouble` on a non-float sets
-/// a TypeError on the interpreter, which PyO3 later converts to SystemError.
-/// Using `PyFloat_Check` first avoids calling `PyFloat_AsDouble` on non-floats
-/// entirely, so the exception state is never touched.
-///
-/// Callers can detect non-float elements by checking `val.is_nan()`.
-///
-/// # Safety
-/// - GIL must be held.
-/// - `ptr` must be a live, non-null Python object (refcount > 0).
+/// Non-float → NaN is consistent with the Arrow null path (spec-027).
+/// SIMD filter ops (col > x) naturally exclude NaN (IEEE 754).
 #[inline]
-unsafe fn pyfloat_ob_fval(ptr: *mut pyo3::ffi::PyObject) -> f64 {
-    if pyo3::ffi::PyFloat_Check(ptr) != 0 {
-        pyo3::ffi::PyFloat_AsDouble(ptr)
-    } else {
+unsafe fn pyfloat_as_f64(ptr: *mut pyo3::ffi::PyObject) -> f64 {
+    pyo3::ffi::PyErr_Clear();
+    let val = pyo3::ffi::PyFloat_AsDouble(ptr);
+    if val == -1.0 && !pyo3::ffi::PyErr_Occurred().is_null() {
+        pyo3::ffi::PyErr_Clear();
         f64::NAN
+    } else {
+        val
     }
 }
 
 const CHUNK_SIZE: usize = 4096; // 32 KB — fits in typical L1 cache
 
-/// Materialize a Python list[float] into a fresh Vec<f64> using direct ob_fval reads.
+/// Materialize a Python list[float | None] into a fresh Vec<f64>.
+/// Non-float elements (e.g. None) become NaN.
 fn materialize_lazy_float_list(list_ptr: *mut pyo3::ffi::PyObject) -> Vec<f64> {
     unsafe {
         let n = pyo3::ffi::PyList_Size(list_ptr) as usize;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let elem = pyo3::ffi::PyList_GetItem(list_ptr, i as isize);
-            out.push(pyfloat_ob_fval(elem));
+            out.push(pyfloat_as_f64(elem));
         }
         out
     }
@@ -170,7 +168,7 @@ pub(super) fn count_lazy_float_list(
         unsafe {
             for j in 0..chunk_size {
                 let elem = pyo3::ffi::PyList_GetItem(list_ptr, (i + j) as isize);
-                chunk_buf[j] = pyfloat_ob_fval(elem);
+                chunk_buf[j] = pyfloat_as_f64(elem);
             }
         }
         total += count_fused_f64_bounded(&chunk_buf[..chunk_size], ops, 0, None);
@@ -178,6 +176,7 @@ pub(super) fn count_lazy_float_list(
     }
     total
 }
+
 
 /// Execute a LazyFloatList pipeline.
 ///
@@ -216,7 +215,7 @@ pub(super) fn execute_lazy_float_list(
         unsafe {
             for j in 0..chunk_size {
                 let elem = pyo3::ffi::PyList_GetItem(list_ptr, (i + j) as isize);
-                chunk_buf[j] = pyfloat_ob_fval(elem);
+                chunk_buf[j] = pyfloat_as_f64(elem);
             }
         }
 
