@@ -42,68 +42,10 @@ maturin develop --release
 
 ---
 
-## Development (Make + Docker)
+## Contributing
 
-All development tasks run inside Docker — no local Rust or Python setup needed beyond Docker itself.
-
-### Quick reference
-
-| Command | What it does |
-|---|---|
-| `make dc-test` | Build + run Python unit tests |
-| `make dc-test-k K="f64"` | Run tests matching keyword `f64` |
-| `make dc-bench` | Build + run **all** benchmark suites |
-| `make dc-bench-filter` | filter benchmarks only |
-| `make dc-bench-chained` | chained pipeline benchmarks only |
-| `make dc-bench-agg` | aggregation benchmarks (vs numpy / pandas / polars) |
-| `make dc-bench-numpy` | numpy comparison benchmarks |
-| `make dc-bench-objects` | Python object (dict / dataclass) benchmarks |
-| `make dc-bench-vector` | vector search — top-K early stopping |
-| `make dc-bench-ml` | ML feature preprocessing pipeline |
-| `make dc-bench-etl` | ETL multi-stat aggregation (vs Polars / Pandas) |
-| `make dc-bench-fraud` | fraud / risk scoring — review queue, exposure sum |
-| `make dc-bench-groupby` | GroupBy and pagination (object path) |
-| `make dc-bench-null` | null-mixed list benchmarks (None handling) |
-| `make dc-bench-rust` | Rust (Criterion) benchmarks |
-| `make dc-bench-save` | Save current results as baseline |
-| `make dc-bench-compare` | Compare against saved baseline (fails on >10% regression) |
-| `make dc-shell` | Interactive shell inside the container |
-| `make dc-image` | Rebuild the Docker image |
-| `make dc-clean` | Remove named volumes (reset Cargo + target cache) |
-
-### Typical workflow
-
-```bash
-# First time: build the image (takes a few minutes — downloads Rust toolchain)
-make dc-image
-
-# Edit Rust source, then test
-make dc-test
-
-# Measure performance against all libraries
-make dc-bench-agg
-
-# Run a single aggregation benchmark suite and compare against baseline
-make dc-bench-save             # save current run as baseline
-# ... make changes ...
-make dc-bench-compare          # fails if mean regresses by >10%
-
-# Open a shell to inspect the built extension
-make dc-shell
-(inside) python -c "from zpyflow import Query, col; print(Query([1,2,3]).filter(col>1).to_list())"
-```
-
-### Local build (requires Rust + maturin on host)
-
-```bash
-make build          # maturin develop --release
-make test           # build + pytest
-make bench          # build + all Python benchmarks
-make bench-rust     # cargo bench
-make lint           # cargo clippy
-make fmt            # cargo fmt + ruff format
-make clean          # remove build artifacts
-```
+See **[docs/contributing.md](docs/contributing.md)** for development setup,
+Make commands, benchmarks, and how to submit changes.
 
 ---
 
