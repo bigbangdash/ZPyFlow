@@ -3,7 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**.md"
+      - "mkdocs.yml"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**.md"
+      - "mkdocs.yml"
   workflow_dispatch:
     inputs:
       run_quick:
