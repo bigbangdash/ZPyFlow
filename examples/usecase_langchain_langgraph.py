@@ -166,11 +166,109 @@ def get_category_risk_summary() -> dict[str, Any]:
         }
     return summary
 
+
+@tool
+def get_flagged_transactions(
+    category: str | None = None,
+    min_amount: float = 0.0,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """
+    Retrieve flagged or declined transaction records (dict objects) with optional
+    category and amount filters. Returns full transaction objects.
+
+    Uses ZPyFlow's object pipeline:
+      - field() DSL for GIL-free status/category filtering on dict records
+      - lambda for combined multi-field conditions
+      - take() for early stopping
+      - map_field() to extract just the IDs for a count
+    """
+    from zpyflow import field
+
+    # Base filter: status is flagged or declined (field() DSL — GIL-free after conversion)
+    q = Query(transactions).filter(
+        (field("status") == "flagged") | (field("status") == "declined")
+    )
+
+    # Optional category filter (lambda — stays on object path)
+    if category:
+        q = q.filter(lambda t, c=category: t["category"] == c)
+
+    # Optional amount filter (lambda on dict field)
+    if min_amount > 0:
+        q = q.filter(lambda t, m=min_amount: t["amount"] >= m)
+
+    total_matching = q.count()
+
+    # Early-stop: fetch only `limit` full objects
+    sample = q.take(limit).to_list()
+
+    # Extract just amounts for a quick aggregate (map_field → numeric list)
+    all_amounts = q.map_field("amount").to_list()
+    avg_amount = sum(all_amounts) / len(all_amounts) if all_amounts else 0.0
+
+    return {
+        "total_matching": total_matching,
+        "avg_amount":     round(avg_amount, 2),
+        "sample_records": [
+            {k: t[k] for k in ("id", "amount", "risk_score", "category", "status")}
+            for t in sample
+        ],
+    }
+
+
+@tool
+def search_transactions_by_profile(
+    status: str = "flagged",
+    category: str = "online",
+    min_risk: float = 0.5,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """
+    Multi-field search on transaction objects. Chains object filters and
+    extracts a structured result set.
+
+    Uses ZPyFlow's object pipeline with lambda chaining:
+      - Each .filter() narrows the dict records
+      - .take() stops early once top_k are collected
+      - .to_list() materializes only the selected records
+    """
+    results = (
+        Query(transactions)
+        .filter(lambda t, s=status:   t["status"]   == s)
+        .filter(lambda t, c=category: t["category"] == c)
+        .filter(lambda t, r=min_risk:  t["risk_score"] >= r)
+        .take(top_k)
+        .to_list()
+    )
+
+    if not results:
+        return {
+            "message": f"No {status} {category} transactions with risk >= {min_risk}",
+            "count": 0,
+        }
+
+    return {
+        "count":   len(results),
+        "filters": {"status": status, "category": category, "min_risk": min_risk},
+        "records": [
+            {k: t[k] for k in ("id", "amount", "risk_score", "category", "status")}
+            for t in results
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # 4. LangGraph agent
 # ---------------------------------------------------------------------------
 
-tools = [get_transaction_stats, get_high_risk_transactions, get_category_risk_summary]
+tools = [
+    get_transaction_stats,
+    get_high_risk_transactions,
+    get_category_risk_summary,
+    get_flagged_transactions,
+    search_transactions_by_profile,
+]
 llm = get_llm()
 llm_with_tools = llm.bind_tools(tools)
 
@@ -199,8 +297,13 @@ app = graph.compile()
 # ---------------------------------------------------------------------------
 
 queries = [
+    # Numeric aggregation (SIMD path)
     "How many transactions are above $1,000? What's the total value?",
     "Find high-risk transactions with a risk score above 0.85. How many are there?",
+    # Object filtering (dict record pipeline)
+    "Show me some flagged online transactions with amount over $500.",
+    "Find declined travel transactions with a risk score of at least 0.6. Show details.",
+    # Combined / summary
     "Which transaction category has the highest average risk score?",
 ]
 
