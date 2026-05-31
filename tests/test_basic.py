@@ -2208,58 +2208,38 @@ class TestToDict:
 class TestNoneInList:
     """Behavior when a Python list contains None values.
 
+    Fix (spec-048): pyfloat_ob_fval now uses PyFloat_Check before PyFloat_AsDouble.
+    Non-float elements (None, int, str) return NaN without touching exception state.
+
     ZPyFlow infers the pipeline type from the FIRST element:
     - first element is float → LazyFloatList:
-        BOTH DSL and lambda ops fail when None is encountered
-        (None cannot be extracted as f64 even for the lambda path)
+        None → NaN → filtered out by DSL (NaN > 0 is False)
+        lambda path: None becomes NaN (a Python float), lambda receives float('nan')
     - first element is None  → Obj fallback:
         lambda works; None is passed as a Python object to the callable
-
-    Safe approaches for nullable float data:
-    1. Put None first so Query falls to Obj path, then use lambda guard
-    2. Pre-filter: [x for x in data if x is not None] before Query()
-    3. from_arrow() with NaN fill (see bench_arrow.py TestArrowF64WithNulls)
     """
 
-    # ── LazyFloatList path (starts with float): both DSL and lambda fail ───
+    # ── LazyFloatList path (starts with float): None → NaN → filtered out ──
 
-    @pytest.mark.xfail(reason="state-dependent: raises in isolation, succeeds after test #317 — root cause under investigation in spec 048")
-    def test_dsl_filter_raises_on_none_element(self):
-        """LazyFloatList + col > 0: behavior when None is present is state-dependent.
-
-        Root cause (spec 048 D-2 findings):
-        - `materialize_lazy_float_list` calls `PyFloat_AsDouble(None)` → -1.0 + sets TypeError
-        - The exception state is left set; PyO3 propagates it on return
-        - After test #317 (TestToDict::test_empty_returns_empty_dict), the exception
-          is somehow cleared before propagation — exact mechanism TBD
-        """
+    def test_dsl_filter_converts_none_to_nan(self):
+        """LazyFloatList + col > 0: None becomes NaN, which fails the filter (NaN > 0 is False)."""
         data = [1.0, None, 2.0]
-        try:
-            Query(data).filter(col > 0).to_list()
-            pytest.fail("Expected TypeError or SystemError but no exception was raised")
-        except (TypeError, SystemError):
-            pass
+        result = Query(data).filter(col > 0).to_list()
+        assert result == [1.0, 2.0]
 
-    @pytest.mark.xfail(reason="state-dependent — spec 048")
-    def test_dsl_count_raises_on_none_element(self):
-        """count() on LazyFloatList with None — same state-dependent behavior."""
-        data = [1.0, None, 2.0]
-        try:
-            Query(data).filter(col > 0).count()
-            pytest.fail("Expected TypeError or SystemError but no exception was raised")
-        except (TypeError, SystemError):
-            pass
+    def test_dsl_count_excludes_none(self):
+        """count() with None in LazyFloatList: NaN is filtered out."""
+        data = [1.0, None, 2.0, None, -1.0]
+        result = Query(data).filter(col > 0).count()
+        assert result == 2
 
-    def test_lambda_filter_also_raises_on_float_first_list(self):
-        """LazyFloatList: lambda filter also errors on None (float-first list).
-        Use a list starting with None (Obj path) or pre-filter None values.
+    def test_lambda_filter_on_float_first_list(self):
+        """LazyFloatList + lambda: None becomes NaN; lambda receives float('nan').
+        `x is not None` is True for NaN, but `x > 0` is False — so NaN is filtered out.
         """
         data = [1.0, None, -1.0, None, 2.0]
-        try:
-            Query(data).filter(lambda x: x is not None and x > 0).to_list()
-            pytest.fail("Expected TypeError or SystemError but no exception was raised")
-        except (TypeError, SystemError):
-            pass
+        result = Query(data).filter(lambda x: x is not None and x > 0).to_list()
+        assert result == [1.0, 2.0]
 
     # ── Obj path (starts with None): lambda works ──────────────────────────
 

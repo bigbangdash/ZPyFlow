@@ -104,16 +104,28 @@ impl Drop for RawBuffer {
 // so ob_fval never changes after allocation.
 // ---------------------------------------------------------------------------
 
-/// Read ob_fval via the stable C API — no hardcoded byte offset.
-/// PyFloat_AsDouble returns -1.0 on type mismatch (with exception set);
-/// since Query::new() validates that all elements are float, this never fires.
+/// Extract f64 from a Python object without ever setting an exception.
+///
+/// - PyFloat → reads ob_fval directly via PyFloat_AsDouble (fast, no exception)
+/// - non-float (e.g. None, int, str) → returns NaN without touching exception state
+///
+/// This is the key fix for spec-048: `PyFloat_AsDouble` on a non-float sets
+/// a TypeError on the interpreter, which PyO3 later converts to SystemError.
+/// Using `PyFloat_Check` first avoids calling `PyFloat_AsDouble` on non-floats
+/// entirely, so the exception state is never touched.
+///
+/// Callers can detect non-float elements by checking `val.is_nan()`.
 ///
 /// # Safety
 /// - GIL must be held.
-/// - `ptr` must be a live, non-null `PyFloat` object (refcount > 0).
+/// - `ptr` must be a live, non-null Python object (refcount > 0).
 #[inline]
 unsafe fn pyfloat_ob_fval(ptr: *mut pyo3::ffi::PyObject) -> f64 {
-    pyo3::ffi::PyFloat_AsDouble(ptr)
+    if pyo3::ffi::PyFloat_Check(ptr) != 0 {
+        pyo3::ffi::PyFloat_AsDouble(ptr)
+    } else {
+        f64::NAN
+    }
 }
 
 const CHUNK_SIZE: usize = 4096; // 32 KB — fits in typical L1 cache

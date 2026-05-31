@@ -165,7 +165,7 @@ ZPyFlow infers the pipeline type from the **first element**. None handling depen
 
 | First element | Path | DSL (`col > 0`) | lambda (`x is not None and x > 0`) |
 |--------------|------|-----------------|-------------------------------------|
-| `float` | LazyFloatList | ❌ TypeError | ❌ TypeError (None cannot be converted to f64) |
+| `float` | LazyFloatList | ✅ None → NaN → filtered out | ✅ None → NaN → lambda sees `float('nan')` |
 | `None`  | Obj fallback  | ❌ not supported | ✅ lambda receives None as-is |
 | `dict`  | Obj path      | ✅ field() DSL | ✅ lambda |
 
