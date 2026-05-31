@@ -106,3 +106,53 @@ make dc-bench-compare     # fails if mean regresses by >10%
 
 Please keep PRs focused. Large refactors benefit from a spec task discussion first
 (see `specs/` directory).
+
+---
+
+## Releasing
+
+### Pre-release checks
+
+```bash
+# Build + test + type-check
+docker compose run --rm test sh -c \
+  'maturin develop --release && pytest tests/ -q && mypy zpyflow tests/typing_examples.py'
+
+# Build wheel and smoke-test in a clean venv
+docker compose run --rm test sh -c "
+  maturin build --release &&
+  python3 -m venv /tmp/check &&
+  /tmp/check/bin/pip install -q /app/target/wheels/zpyflow-*.whl &&
+  /tmp/check/bin/python -c \"
+from zpyflow import Query, col
+assert Query([1,2,3]).filter(col>1).to_list() == [2,3]
+print('OK')
+\"
+"
+```
+
+### TestPyPI dry run (optional)
+
+```bash
+maturin publish --repository testpypi --skip-existing
+pip install --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ zpyflow
+```
+
+### Publish to PyPI
+
+```bash
+# 1. Bump version in pyproject.toml and Cargo.toml
+# 2. Commit and push to main
+git tag v0.1.1
+git push origin v0.1.1
+# 3. Create a GitHub Release for the tag
+#    → release.yml builds Linux + macOS wheels and publishes to PyPI
+```
+
+### Package metadata
+
+- Package name: `zpyflow`
+- Python support: CPython 3.10+ (abi3 wheel)
+- License: MIT
+- Extras: `zpyflow[numpy]`, `zpyflow[arrow]`, `zpyflow[dev]`
