@@ -114,7 +114,7 @@ make clean          # remove build artifacts
 6. [Dict records and log processing](#6-dict-records-and-log-processing)
 7. [GroupBy and aggregation](#7-groupby-and-aggregation)
 8. [CSV and JSON Lines streaming](#8-csv-and-json-lines-streaming)
-9. [AI and embedding pipelines](#9-ai-and-embedding-pipelines)
+9. [AI, embeddings, and LangChain / LangGraph](#9-ai-and-embedding-pipelines)
 10. [Parallel execution](#10-parallel-execution)
 11. [Full API reference](#11-full-api-reference)
 12. [Performance](#12-performance)
@@ -747,6 +747,87 @@ norm_query = Query(norms)
 print(f"min={norm_query.min():.4f}  max={norm_query.max():.4f}  "
       f"mean={norm_query.sum()/norm_query.count():.4f}")
 ```
+
+### LangChain / LangGraph integration
+
+ZPyFlow slots into LangChain and LangGraph wherever a node processes large numeric arrays.
+No special integration is needed — just use it in your node functions or tools.
+
+**RAG retrieval — filter similarity scores with early stopping**
+
+```python
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+from zpyflow import from_numpy, col
+
+class ZPyFlowRetriever(BaseRetriever):
+    """Retriever that uses ZPyFlow for fast threshold filtering."""
+
+    docs: list[Document]
+    embeddings: object  # any embedding model
+
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        import numpy as np
+
+        query_vec = self.embeddings.embed_query(query)
+        scores = np.array([
+            np.dot(query_vec, self.embeddings.embed_documents([d.page_content])[0])
+            for d in self.docs
+        ])
+
+        # SIMD filter + early stopping — never scans beyond the K-th hit
+        top_indices = (
+            from_numpy(scores)
+            .filter(col > 0.7)
+            .take(20)
+            .to_list()
+        )
+        return [self.docs[int(i)] for i in top_indices]
+```
+
+**LangGraph node — aggregate tool results without materializing a full list**
+
+```python
+from langgraph.graph import StateGraph, MessagesState
+
+def score_filter_node(state: MessagesState) -> dict:
+    """LangGraph node: filter and aggregate a large score array from a tool call."""
+    scores: list[float] = state["tool_scores"]  # e.g. 500K candidates
+
+    q = Query(scores)
+    return {
+        "candidate_count": q.filter(col > 0.8).count(),   # stays in Rust
+        "top_score":       q.max(),
+        "mean_score":      q.sum() / q.count(),
+    }
+
+graph = StateGraph(MessagesState)
+graph.add_node("score_filter", score_filter_node)
+```
+
+**LangChain tool — return pre-aggregated stats to the LLM**
+
+```python
+from langchain_core.tools import tool
+from zpyflow import Query, col
+
+@tool
+def analyze_search_results(scores: list[float]) -> dict:
+    """Aggregate similarity scores from a vector search."""
+    q = Query(scores)
+    n = q.count()
+    return {
+        "total":        n,
+        "high_quality": q.filter(col > 0.85).count(),
+        "low_quality":  q.filter(col < 0.5).count(),
+        "best_score":   q.max(),
+        "mean_score":   round(q.sum() / n, 4) if n else 0.0,
+    }
+```
+
+> **When ZPyFlow helps in AI pipelines**: large numeric score arrays (similarity, confidence,
+> reward, logprobs) where you threshold-filter and aggregate. It does not speed up LLM calls
+> themselves (those are I/O-bound) or small lists (< 10K elements).
 
 ---
 
