@@ -78,11 +78,11 @@ revenues = df["revenue"].tolist()
 enterprise_mask = df["plan"] == "enterprise"
 enterprise_rev  = df.loc[enterprise_mask, "revenue"].tolist()
 
-q = Query(enterprise_rev)
+rev_query = Query(enterprise_rev)
 stats = {
-    "count": q.count(),
-    "sum":   round(q.sum(), 2),
-    "max":   round(q.max(), 2),
+    "count": rev_query.count(),
+    "sum":   round(rev_query.sum(), 2),
+    "max":   round(rev_query.max(), 2),
     "above_100": Query(enterprise_rev).filter(col > 100).count(),
 }
 print(f"\nCase 3 — enterprise revenue stats: {stats}")

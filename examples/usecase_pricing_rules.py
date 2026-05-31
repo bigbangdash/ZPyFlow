@@ -57,11 +57,11 @@ discounted_prices = (
 )
 ms = (time.perf_counter() - t0) * 1000
 
-q = Query(discounted_prices)
+prices_query = Query(discounted_prices)
 print(f"\nCase 2 — Promotional discount ({DISCOUNT_RATE:.0%} off mid-tier ${MID_TIER_LO}–${MID_TIER_HI}):")
 print(f"  Affected products: {len(discounted_prices):,}")
-print(f"  Price range after discount: [${q.min():.2f}, ${q.max():.2f}]")
-print(f"  Total revenue at new prices: ${q.sum():,.0f}")
+print(f"  Price range after discount: [${prices_query.min():.2f}, ${prices_query.max():.2f}]")
+print(f"  Total revenue at new prices: ${prices_query.sum():,.0f}")
 print(f"  Time: {ms:.2f}ms")
 
 # ------------------------------------------------------------------

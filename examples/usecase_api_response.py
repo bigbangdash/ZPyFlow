@@ -89,17 +89,17 @@ SLO_MS = 500.0
 
 t0 = time.perf_counter()
 latencies = latency_response["latencies"]
-q = Query(latencies)
+latency_query = Query(latencies)
 
-total_requests  = q.count()
-breaching       = q.filter(col > SLO_MS).count()
+total_requests  = latency_query.count()
+breaching       = latency_query.filter(col > SLO_MS).count()
 slo_compliance  = (1 - breaching / total_requests) * 100
 ms              = (time.perf_counter() - t0) * 1000
 
 print(f"\nCase 2 — Latency endpoint ({len(latencies):,} requests):")
 print(f"  SLO ({SLO_MS}ms): {slo_compliance:.2f}% compliant")
 print(f"  Breaching: {breaching:,} requests")
-print(f"  Max latency: {q.max():.0f}ms")
+print(f"  Max latency: {latency_query.max():.0f}ms")
 print(f"  Time: {ms:.2f}ms")
 
 # ------------------------------------------------------------------

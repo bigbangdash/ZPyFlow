@@ -31,10 +31,10 @@ random.seed(99)
 
 def make_csv_source(n: int) -> io.StringIO:
     buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["product_id", "name", "price", "category", "stock", "rating"])
+    writer = csv.writer(buf)
+    writer.writerow(["product_id", "name", "price", "category", "stock", "rating"])
     for i in range(n):
-        w.writerow([
+        writer.writerow([
             f"P{i:06d}",
             f"Product {i}",
             round(random.uniform(0.5, 999.9), 2),

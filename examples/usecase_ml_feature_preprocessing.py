@@ -44,8 +44,8 @@ print(f"Case 1 — Outlier removal + normalize (N={N:,}):")
 print(f"  Input:  {N:,}")
 print(f"  Output: {len(processed):,} ({len(processed)/N*100:.1f}% survived)")
 print(f"  Time:   {ms:.1f}ms")
-q = Query(processed)
-print(f"  Range:  [{q.min():.4f}, {q.max():.4f}]  (expected [-1, 1])")
+processed_query = Query(processed)
+print(f"  Range:  [{processed_query.min():.4f}, {processed_query.max():.4f}]  (expected [-1, 1])")
 
 # ------------------------------------------------------------------
 # Case 2: Outlier removal + normalize + sub-sample (take N)
@@ -96,8 +96,8 @@ for feat, values in FEATURES.items():
 ms = (time.perf_counter() - t0) * 1000
 print(f"  Time: {ms:.1f}ms")
 for feat, vals in preprocessed.items():
-    q = Query(vals)
-    print(f"  {feat:16s}  n={len(vals):,}  min={q.min():.4f}  max={q.max():.4f}")
+    feat_query = Query(vals)
+    print(f"  {feat:16s}  n={len(vals):,}  min={feat_query.min():.4f}  max={feat_query.max():.4f}")
 
 # ------------------------------------------------------------------
 # Case 4: Clip + count (how many outliers?)

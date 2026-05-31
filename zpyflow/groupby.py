@@ -116,10 +116,10 @@ class GroupBy(Generic[K, T]):
     def sum_per_group(self, field: Callable[[T], float] | None = None) -> dict[K, float]:
         result: dict[K, float] = {}
         for key, items in self._groups.items():
-            q = Query(items)
+            item_query = Query(items)
             if field is not None:
-                q = q.map(field)
-            result[key] = float(q.sum())
+                item_query = item_query.map(field)
+            result[key] = float(item_query.sum())
         return result
 
     def __len__(self) -> int:

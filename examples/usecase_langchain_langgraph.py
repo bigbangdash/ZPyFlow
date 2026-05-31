@@ -102,16 +102,16 @@ def get_transaction_stats(threshold_amount: float = 0.0) -> dict[str, Any]:
     Return summary statistics for transactions above a given amount threshold.
     Uses ZPyFlow SIMD aggregation — all ops stay in Rust, no Python list created.
     """
-    q = from_numpy(amounts).filter(col > threshold_amount)
-    n = q.count()
+    amounts_query = from_numpy(amounts).filter(col > threshold_amount)
+    n = amounts_query.count()
     if n == 0:
         return {"count": 0, "message": f"No transactions above {threshold_amount}"}
     return {
         "count":   n,
-        "total":   round(q.sum(), 2),
-        "mean":    round(q.sum() / n, 2),
-        "max":     round(q.max(), 2),
-        "min":     round(q.min(), 2),
+        "total":   round(amounts_query.sum(), 2),
+        "mean":    round(amounts_query.sum() / n, 2),
+        "max":     round(amounts_query.max(), 2),
+        "min":     round(amounts_query.min(), 2),
         "pct_of_total": round(n / N_TRANSACTIONS * 100, 2),
     }
 
@@ -154,8 +154,8 @@ def get_category_risk_summary() -> dict[str, Any]:
     categories = ["retail", "travel", "online", "atm", "p2p"]
     summary = {}
     for cat in categories:
-        q = Query(transactions).filter(lambda t, c=cat: t["category"] == c)
-        n = q.count()
+        cat_query = Query(transactions).filter(lambda t, c=cat: t["category"] == c)
+        n = cat_query.count()
         if n == 0:
             continue
         risk_vals = [t["risk_score"] for t in transactions if t["category"] == cat]
@@ -186,25 +186,25 @@ def get_flagged_transactions(
     from zpyflow import field
 
     # Base filter: status is flagged or declined (field() DSL — GIL-free after conversion)
-    q = Query(transactions).filter(
+    flagged_query = Query(transactions).filter(
         (field("status") == "flagged") | (field("status") == "declined")
     )
 
     # Optional category filter (lambda — stays on object path)
     if category:
-        q = q.filter(lambda t, c=category: t["category"] == c)
+        flagged_query = flagged_query.filter(lambda t, c=category: t["category"] == c)
 
     # Optional amount filter (lambda on dict field)
     if min_amount > 0:
-        q = q.filter(lambda t, m=min_amount: t["amount"] >= m)
+        flagged_query = flagged_query.filter(lambda t, m=min_amount: t["amount"] >= m)
 
-    total_matching = q.count()
+    total_matching = flagged_query.count()
 
     # Early-stop: fetch only `limit` full objects
-    sample = q.take(limit).to_list()
+    sample = flagged_query.take(limit).to_list()
 
     # Extract just amounts for a quick aggregate (map_field → numeric list)
-    all_amounts = q.map_field("amount").to_list()
+    all_amounts = flagged_query.map_field("amount").to_list()
     avg_amount = sum(all_amounts) / len(all_amounts) if all_amounts else 0.0
 
     return {

@@ -60,14 +60,14 @@ t0 = time.perf_counter()
 
 batch_stats = []
 for batch in batch_scores_all:
-    q = from_numpy(batch)
-    n = q.count()
+    batch_query = from_numpy(batch)
+    n = batch_query.count()
     batch_stats.append({
         "n":          n,
-        "mean":       q.sum() / n,
-        "high_conf":  q.filter(col > 0.9).count(),
-        "low_conf":   q.filter(col < 0.3).count(),
-        "max":        q.max(),
+        "mean":       batch_query.sum() / n,
+        "high_conf":  batch_query.filter(col > 0.9).count(),
+        "low_conf":   batch_query.filter(col < 0.3).count(),
+        "max":        batch_query.max(),
     })
 
 stats_ms = (time.perf_counter() - t0) * 1000
@@ -130,9 +130,9 @@ t0 = time.perf_counter()
 # Validate and normalize each feature column via ZPyFlow
 processed = {}
 for feat, values in raw_features.items():
-    q = from_numpy(values)
-    vmin = q.min()
-    vmax = q.max()
+    feat_query = from_numpy(values)
+    vmin = feat_query.min()
+    vmax = feat_query.max()
     # Min-max scale to [0, 1], clipping at ±3σ equivalent
     # PyExpr is single-op: chain two .map() calls for shift + scale.
     # map((col - vmin) / range) would silently lose the subtraction.
@@ -149,8 +149,8 @@ preproc_ms = (time.perf_counter() - t0) * 1000
 print(f"\nCase 4 — Feature preprocessing ({N:,} rows, 5 features):")
 print(f"  Time: {preproc_ms:.1f}ms")
 for feat, values in processed.items():
-    q = Query(values)
-    print(f"  {feat:20s}  min={q.min():.4f}  max={q.max():.4f}  n={q.count():,}")
+    feat_stats = Query(values)
+    print(f"  {feat:20s}  min={feat_stats.min():.4f}  max={feat_stats.max():.4f}  n={feat_stats.count():,}")
 
 # ------------------------------------------------------------------
 # Case 5: LLM token probability filtering (top-p / nucleus sampling)
