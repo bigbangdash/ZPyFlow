@@ -51,6 +51,7 @@ Each file explains the business context and maps it to ZPyFlow operations.
 | [`usecase_order_processing.py`](usecase_order_processing.py) | Order filtering, status grouping, high-value notifications | E-commerce, Logistics |
 | [`usecase_user_segmentation.py`](usecase_user_segmentation.py) | Churn risk detection, upsell targeting, cohort metrics | SaaS, CRM, Marketing |
 | [`usecase_content_pipeline.py`](usecase_content_pipeline.py) | Feed generation, editorial queue, category analytics | Media, CMS, Newsletter |
+| [`usecase_langchain_langgraph.py`](usecase_langchain_langgraph.py) | RAG retriever, LangGraph node, LangChain tool, batch scoring | LLM apps, AI agents, RAG |
 
 ---
 
