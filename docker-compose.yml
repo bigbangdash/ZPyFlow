@@ -23,6 +23,10 @@ x-base: &base
     - ./sandbox/benchmark/results:/app/sandbox/benchmark/results
   working_dir: /app
 
+# Remove any cpython-version-specific .so files left by non-release builds.
+# Python prefers cpython-NNN.so over abi3.so, so stale files cause loading
+# of outdated code even after maturin develop --release rebuilds abi3.so.
+
 
 services:
 
@@ -50,6 +54,7 @@ services:
     <<: *base
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         pytest tests/ -v --tb=short
       "
@@ -60,6 +65,7 @@ services:
     <<: *base
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         python sandbox/benchmark/run.py --suite all --config default
       "
@@ -73,6 +79,7 @@ services:
       SUITE: ${SUITE:-filter}
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         python sandbox/benchmark/run.py --suite $${SUITE} --config default
       "
@@ -90,6 +97,7 @@ services:
       SUITE: ${SUITE:-filter}
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         python sandbox/benchmark/run.py --suite $${SUITE} --save
       "
@@ -100,6 +108,7 @@ services:
       SUITE: ${SUITE:-filter}
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         python sandbox/benchmark/run.py --suite $${SUITE} --compare
       "
@@ -112,6 +121,7 @@ services:
     tty: true
     command: >
       sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
         bash
       "
