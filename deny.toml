@@ -2,6 +2,13 @@
 # Deny known security vulnerabilities.
 version = 2
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2025-0020: pyo3 0.21.2 — PyString::from_object buffer overflow
+    # ZPyFlow does NOT call PyString::from_object anywhere in src/.
+    # All string construction goes through PyString::new_bound.
+    # Accepting known risk: the vulnerable code path is never reached.
+    "RUSTSEC-2025-0020",
+]
 
 [licenses]
 # Allow common permissive and copyleft licenses used by the dependency tree.
