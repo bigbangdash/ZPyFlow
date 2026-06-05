@@ -43,13 +43,22 @@ Query(data: Iterable[T]) -> Query[T]
 | `.parallel()` | Request parallel execution (numeric paths only) |
 | `.take_while(pred)` | Yield while `pred` is true, then stop |
 | `.skip_while(pred)` | Skip while `pred` is true, then yield the rest |
-| `.chain(other)` | Concatenate `other` after this query |
+| `.chain(other)` | Concatenate another `Query` after this one (typed fast path for f64/i64) |
+| `.concat(other)` | Concatenate any iterable (list, generator, or `Query`) after this one |
 | `.enumerate()` | Yield `(index, item)` tuples |
 | `.zip(other)` | Pair with `other` (stops at shorter) |
 | `.flat_map(f)` | Apply `f` and flatten one level |
 | `.preload()` | Convert dict records to RustObj eagerly |
 | `.group_by(key_fn)` | Group elements into a `GroupBy` object |
 | `.group_agg(key_fn, **specs)` | Single-pass group + aggregate (Rust kernel) |
+| `.cache()` | Materialise the pipeline into a list and return a reusable Query |
+| `.tee(n=2)` | Materialise once and return `n` independent Query copies as a tuple |
+| `.chunk(n)` | Split into fixed-size sublists of length `n` (last chunk may be shorter) |
+| `.sort(reverse=False)` | Return a new `Query` with elements in sorted order |
+| `.sort_by(key_fn, reverse=False)` | Return a new `Query` sorted by `key_fn` |
+| `.distinct(key_fn=None)` | Remove duplicates, preserving insertion order |
+| `.scan(f, initial)` | Running accumulation — yield every intermediate value |
+| `.sliding_window(n)` | Yield overlapping tuples of `n` consecutive elements |
 
 ### Terminal operations
 
@@ -57,12 +66,18 @@ Query(data: Iterable[T]) -> Query[T]
 |---|---|
 | `.to_list()` | Collect to `list` |
 | `.to_dict(key, value)` | Collect to `dict` |
+| `.to_numpy()` | Collect to numpy `ndarray` (no per-element boxing; f64/i64/u8 only) |
 | `.count()` | Count matching elements |
 | `.sum()` | Sum (SIMD for numeric) |
+| `.mean()` | Arithmetic mean, or `None` if empty (single SIMD pass for f64 + filter) |
+| `.var()` | Population variance (ddof=0), or `None` if empty |
+| `.std()` | Population standard deviation (ddof=0), or `None` if empty |
 | `.min()` | Minimum value |
 | `.max()` | Maximum value (SIMD for f64) |
+| `.stats()` | `{"count", "sum", "mean", "min", "max"}` in a single SIMD pass |
 | `.first()` | First element or `None` |
 | `.last()` | Last element or `None` |
+| `.partition(pred)` | `(matching_list, non_matching_list)` in one pass (callable / `FieldExpr`) |
 | `.reduce(fn, initial)` | General left fold |
 | `.for_each(fn)` | Consume for side effects |
 | `.any(pred)` | True if any element matches (short-circuits) |
@@ -85,6 +100,8 @@ col + 1.0        # MapAddScalar
 col - 1.0        # MapSubScalar
 col / 2.0        # MapDivScalar
 col ** 2         # MapPowScalar
+col % 2          # MapMod (remainder)
+col // 2         # MapFloorDiv
 -col             # MapNeg
 col.abs()        # MapAbs
 col.sqrt()       # MapSqrt
@@ -92,6 +109,12 @@ col.floor()      # MapFloor
 col.ceil()       # MapCeil
 col.round()      # MapRound
 col.reciprocal() # MapReciprocal
+col.clamp(lo, hi)  # MapClamp — clamp to [lo, hi]
+col.log()        # MapLog — natural log
+col.log2()       # MapLog2
+col.log10()      # MapLog10
+col.exp()        # MapExp — e^x
+col.sigmoid()    # MapSigmoid — 1/(1+e^-x)
 col.between(a, b)  # FilterBetween (inclusive)
 ```
 

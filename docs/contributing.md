@@ -89,12 +89,40 @@ site/docs/     MkDocs site source
 
 ## Running benchmarks
 
+Docker is the recommended path because it keeps Rust, Python, and benchmark
+dependencies consistent:
+
 ```bash
 # Save current results as baseline, make changes, then compare
 make dc-bench-save
 # ... edit code ...
 make dc-bench-compare     # fails if mean regresses by >10%
 ```
+
+For focused local benchmark runs:
+
+```bash
+# Rust (Criterion) — detailed per-operation breakdown
+cargo bench --bench pipeline
+
+# SIMD selectivity analysis (10% / 25% / 50% / 75% / 90% pass rate)
+cargo bench --bench simd_filter
+
+# Python (pytest-benchmark)
+pip install pytest-benchmark
+pytest tests/test_performance.py -v --benchmark-autosave
+```
+
+To measure memory for a specific script:
+
+```bash
+pip install memory-profiler
+python -m memory_profiler your_script.py
+```
+
+Raw benchmark JSON results are saved in
+[`sandbox/benchmark/results/`](../sandbox/benchmark/results/) after each
+`make dc-bench` run.
 
 ---
 

@@ -2,32 +2,41 @@
 
 ## When ZPyFlow is fast
 
-ZPyFlow wins when the pipeline is **single-stat, small output, or early-stop**:
+ZPyFlow is strongest when the pipeline can stop early, avoid Python callbacks,
+or stay on a typed buffer path. It is not a general replacement for NumPy or
+Polars full-column kernels.
 
-| Use case | Why ZPyFlow wins |
+| Use case | Why it works well |
 |---|---|
-| `filter(col > t).count()` on 1M floats | SIMD, GIL released, 1 pass |
-| `filter(col > t).take(K)` with small K | Early-stop: scans only until K results found |
-| `filter + map + sum` in one pass | Fused, 1 allocation |
-| Embedding threshold + top-K | Fast early-stop vs NumPy full-scan |
+| `filter(col > t).take(K)` with small K | Early-stop: scans only until K results are found |
+| Embedding threshold + top-K | Avoids NumPy's full boolean-index scan |
+| `from_numpy(...).filter(...).to_numpy()` | Typed input and typed output avoid Python list boxing |
+| Boolean flag count from NumPy | Compact `bool` / `uint8` path is faster than Python and often faster than NumPy |
+| Null-free Arrow numeric arrays | Buffer path avoids `to_pylist()` conversion |
+| `field()` filters on large dict records | Can beat plain Python when the field DSL covers the predicate |
 
-## When to use Polars instead
+## When ZPyFlow loses
 
-| Use case | Polars wins because |
+| Use case | Better tool |
 |---|---|
-| 3+ stats in one pass (count + sum + max) | 1 columnar pass vs 3 ZPyFlow passes |
-| Multi-column join | Not supported in ZPyFlow |
-| Loading CSV → table analysis | Natural fit for Polars |
-| SQL-style GROUP BY with multiple columns | Polars native |
+| Full-array `filter`, `map`, `sum`, or `count` on NumPy data | NumPy |
+| Multi-stat ETL reports such as count + sum + max | Polars |
+| Dense vectorized math | NumPy |
+| Multi-column joins, windows, SQL-style analytics | Polars |
+| Small data where readability dominates | Plain Python |
 
-## Benchmark results (1M float64)
+## Recent benchmark shape
 
-| Approach | Time | Allocations | GIL |
-|---|---|---|---|
-| Python list comprehension | ~80ms | 2 lists | held |
-| numpy (`arr[arr > 0] * 2`) | ~8ms | 2 arrays | released |
-| ZPyFlow Expression DSL (SIMD) | ~2–5ms | 1 list | released |
-| ZPyFlow DSL + parallel | ~0.5–1ms | 1 list | released |
+These are representative results from the benchmark suite:
+
+| Case | Result |
+|---|---|
+| `filter + map + take`, N=1M | ZPyFlow DSL around 0.25ms; NumPy around 4.3ms |
+| Vector search top-K, N=1M | ZPyFlow DSL around 0.08ms; NumPy around 1.8ms |
+| `filter -> ndarray`, N=1M | `from_numpy(...).to_numpy()` around 3.3ms; NumPy around 4.1ms |
+| ETL 3-stat, N=1M | Polars around 0.9ms; ZPyFlow single-pass around 9.3ms |
+| Full `filter + sum`, N=1M | NumPy/Polars beat ZPyFlow |
+| Dict field filter/count, N=1M | `field()` DSL can beat Python list comprehensions; lambdas usually do not |
 
 Raw benchmark JSON files are in
 [`sandbox/benchmark/results/`](../../sandbox/benchmark/results/).
@@ -41,7 +50,7 @@ q = Query(data).filter(col > 0).map(col * 2).take(1000)
 print(q.explain())
 # Query.explain()
 #   kind:     f64
-#   ops:      FilterGt(0.0) → MapMulScalar(2.0)
+#   ops:      FilterGt(0.0) -> MapMulScalar(2.0)
 #   skip:     0
 #   take:     1000
 #   parallel: false
@@ -51,13 +60,12 @@ print(q.explain())
 
 ## Parallel execution
 
-`.parallel()` applies to **numeric fast paths only** (f64 / i64).
+`.parallel()` applies to numeric fast paths only.
 
 ```python
-# Multi-threaded: Rayon work-stealing, GIL fully released
 result = Query(large).filter(col > 0).map(col * 2).parallel().to_list()
 ```
 
 !!! warning "Threading overhead"
-    Parallel mode adds split + join overhead.  It is slower than single-threaded
-    for inputs under ~500K elements.  Profile before enabling.
+    Parallel mode adds split + join overhead. It is slower than single-threaded
+    for smaller inputs. Profile before enabling.
