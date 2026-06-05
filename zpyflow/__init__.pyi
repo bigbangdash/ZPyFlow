@@ -30,6 +30,8 @@ class Expr:
     def __sub__(self, other: float) -> Expr: ...
     def __truediv__(self, other: float) -> Expr: ...
     def __pow__(self, other: float, mod: None = None) -> Expr: ...
+    def __mod__(self, other: float) -> Expr: ...
+    def __floordiv__(self, other: float) -> Expr: ...
     def __neg__(self) -> Expr: ...
     def abs(self) -> Expr: ...
     def sqrt(self) -> Expr: ...
@@ -38,6 +40,16 @@ class Expr:
     def round(self) -> Expr: ...
     def reciprocal(self) -> Expr: ...
     def between(self, lo: float, hi: float) -> Expr: ...
+    def log(self) -> Expr: ...
+    def log2(self) -> Expr: ...
+    def log10(self) -> Expr: ...
+    def exp(self) -> Expr: ...
+    def sigmoid(self) -> Expr: ...
+    def clamp(self, lo: float, hi: float) -> Expr: ...
+    def is_nan(self) -> Expr: ...
+    def not_nan(self) -> Expr: ...
+    def is_finite(self) -> Expr: ...
+    def is_inf(self) -> Expr: ...
 
 
 class ColProxy:
@@ -54,6 +66,8 @@ class ColProxy:
     def __sub__(self, other: float) -> Expr: ...
     def __truediv__(self, other: float) -> Expr: ...
     def __pow__(self, other: float, mod: None = None) -> Expr: ...
+    def __mod__(self, other: float) -> Expr: ...
+    def __floordiv__(self, other: float) -> Expr: ...
     def __neg__(self) -> Expr: ...
     def abs(self) -> Expr: ...
     def sqrt(self) -> Expr: ...
@@ -62,6 +76,16 @@ class ColProxy:
     def round(self) -> Expr: ...
     def reciprocal(self) -> Expr: ...
     def between(self, lo: float, hi: float) -> Expr: ...
+    def log(self) -> Expr: ...
+    def log2(self) -> Expr: ...
+    def log10(self) -> Expr: ...
+    def exp(self) -> Expr: ...
+    def sigmoid(self) -> Expr: ...
+    def clamp(self, lo: float, hi: float) -> Expr: ...
+    def is_nan(self) -> Expr: ...
+    def not_nan(self) -> Expr: ...
+    def is_finite(self) -> Expr: ...
+    def is_inf(self) -> Expr: ...
 
 
 col: ColProxy
@@ -93,6 +117,10 @@ class FieldExpr:
     def __eq__(self, other: object) -> FieldExpr: ...  # type: ignore[override]
     def __ne__(self, other: object) -> FieldExpr: ...  # type: ignore[override]
     def between(self, lo: float, hi: float) -> FieldExpr: ...
+    def startswith(self, prefix: str) -> FieldExpr: ...
+    def endswith(self, suffix: str) -> FieldExpr: ...
+    def contains(self, sub: str) -> FieldExpr: ...
+    def matches(self, pattern: str) -> FieldExpr: ...
     def __call__(self, row: dict[str, Any]) -> bool: ...
 
 
@@ -152,6 +180,48 @@ def agg_max(field_fn: Callable[[Any], float]) -> AggSpec:
 
 def agg_min(field_fn: Callable[[Any], float]) -> AggSpec:
     """Minimum of ``field_fn(item)`` over each group."""
+    ...
+
+
+def agg_median(field_fn: Callable[[T], float]) -> Callable[["Query[T]"], float | None]:
+    """GroupBy.agg reducer: median of ``field_fn(item)`` (average of middle two for even groups).
+
+    Returns ``None`` for empty groups.
+
+    Example::
+
+        gb.agg(med=agg_median(lambda r: r["score"]))
+    """
+    ...
+
+
+def agg_std(
+    field_fn: Callable[[T], float], ddof: int = 0
+) -> Callable[["Query[T]"], float | None]:
+    """GroupBy.agg reducer: standard deviation (ddof=0 population, ddof=1 sample).
+
+    Returns ``None`` for empty groups or groups smaller than ``ddof + 1``.
+    """
+    ...
+
+
+def agg_first(
+    field_fn: Callable[[T], Any] | None = None,
+) -> Callable[["Query[T]"], Any]:
+    """GroupBy.agg reducer: first element of the group (or ``field_fn(first)``).
+
+    Returns ``None`` for empty groups.
+    """
+    ...
+
+
+def agg_last(
+    field_fn: Callable[[T], Any] | None = None,
+) -> Callable[["Query[T]"], Any]:
+    """GroupBy.agg reducer: last element of the group (or ``field_fn(last)``).
+
+    Returns ``None`` for empty groups.
+    """
     ...
 
 
@@ -241,6 +311,41 @@ class Query(Generic[T]):
         """
         ...
 
+    @staticmethod
+    def iterate(fn: Callable[[T], T], seed: T) -> "Query[T]":
+        """Infinite sequence: ``[seed, fn(seed), fn(fn(seed)), ...]``.
+
+        Always combine with ``.take(n)`` or ``.take_while(pred)``.
+
+        Example::
+
+            Query.iterate(lambda x: x * 2, 1).take(6).to_list()
+            # [1, 2, 4, 8, 16, 32]
+        """
+        ...
+
+    @staticmethod
+    def repeat(val: T, n: int | None = None) -> "Query[T]":
+        """Repeat *val* exactly *n* times, or infinitely when ``n`` is ``None``.
+
+        Example::
+
+            Query.repeat(0.0, 5).to_list()          # [0.0, 0.0, 0.0, 0.0, 0.0]
+            Query.repeat("x").take(3).to_list()     # ["x", "x", "x"]
+        """
+        ...
+
+    @staticmethod
+    def repeatedly(fn: Callable[[], T], n: int | None = None) -> "Query[T]":
+        """Call ``fn()`` *n* times (or infinitely when ``n`` is ``None``).
+
+        Example::
+
+            import random
+            Query.repeatedly(random.random, 5).to_list()  # 5 random floats
+        """
+        ...
+
     # ------------------------------------------------------------------
     # Lazy combinators
     # ------------------------------------------------------------------
@@ -279,6 +384,316 @@ class Query(Generic[T]):
 
     def chain(self, other: Query[T]) -> Query[T]:
         """Concatenate *other* after this query (zero allocation)."""
+        ...
+
+    def concat(self, other: Iterable[T]) -> Query[T]:
+        """Concatenate *other* (any iterable) after this query.
+
+        Unlike :meth:`chain`, *other* may be a plain list, generator, or any
+        iterable — it is wrapped in a :class:`Query` automatically.
+
+        Example::
+
+            Query([1, 2]).concat([3, 4]).to_list()   # [1, 2, 3, 4]
+            Query([1, 2]).concat(x for x in [3]).to_list()  # [1, 2, 3]
+        """
+        ...
+
+    def chunk(self, n: int) -> "Query[list[T]]":
+        """Split into fixed-size sublists of length *n* (last chunk may be shorter).
+
+        Example::
+
+            Query([1, 2, 3, 4, 5]).chunk(2).to_list()
+            # [[1, 2], [3, 4], [5]]
+        """
+        ...
+
+    def partition(
+        self, pred: FieldExpr | Callable[[T], bool]
+    ) -> tuple[list[T], list[T]]:
+        """Split elements into ``(matching, non_matching)`` in a single pass.
+
+        Returns a ``(yes_list, no_list)`` tuple.  *pred* must be a callable or
+        :class:`FieldExpr`; numeric :class:`Expr` DSL is not supported.
+
+        Example::
+
+            evens, odds = Query(range(6)).partition(lambda x: x % 2 == 0)
+            # evens=[0, 2, 4], odds=[1, 3, 5]
+        """
+        ...
+
+    def sort(self, reverse: bool = False) -> "Query[T]":
+        """Return a new Query with elements in sorted order.
+
+        Example::
+
+            Query([3, 1, 2]).sort().to_list()          # [1, 2, 3]
+            Query([3, 1, 2]).sort(reverse=True).to_list()  # [3, 2, 1]
+        """
+        ...
+
+    def sort_by(self, key_fn: Callable[[T], Any], reverse: bool = False) -> "Query[T]":
+        """Return a new Query sorted by *key_fn*.
+
+        Example::
+
+            Query(records).sort_by(lambda r: r["score"]).to_list()
+        """
+        ...
+
+    def distinct(self, key_fn: Callable[[T], Any] | None = None) -> "Query[T]":
+        """Remove duplicates while preserving insertion order.
+
+        *key_fn* extracts the comparison key; ``None`` compares elements directly.
+
+        Example::
+
+            Query([1, 2, 1, 3, 2]).distinct().to_list()          # [1, 2, 3]
+            Query(records).distinct(lambda r: r["id"]).to_list()  # first occurrence per id
+        """
+        ...
+
+    @overload
+    def scan(self, f: Callable[[U, T], U], initial: U) -> "Query[U]": ...
+    @overload
+    def scan(self, f: Callable[[T, T], T], initial: T) -> "Query[T]": ...
+
+    def scan(self, f: Callable[..., Any], initial: Any) -> "Query[Any]":
+        """Return a Query of running accumulations (like reduce but yielding every step).
+
+        The first yielded value is ``f(initial, items[0])``.
+
+        Example::
+
+            Query([1, 2, 3, 4]).scan(lambda acc, x: acc + x, 0).to_list()
+            # [1, 3, 6, 10]  (cumulative sum)
+        """
+        ...
+
+    def inner_join(
+        self,
+        other: "Query[U]",
+        left_key: Callable[[T], Any],
+        right_key: Callable[[U], Any] | None = None,
+    ) -> "Query[tuple[T, U]]":
+        """Hash inner-join — yield ``(left, right)`` for every matching key pair.
+
+        Only rows whose key appears on both sides are included.
+
+        Example::
+
+            users  = Query([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
+            orders = Query([{"user_id": 1, "item": "book"}, {"user_id": 1, "item": "pen"}])
+            result = users.inner_join(orders, left_key=lambda u: u["id"],
+                                              right_key=lambda o: o["user_id"]).to_list()
+            # [({'id':1,'name':'Alice'}, {'user_id':1,'item':'book'}),
+            #  ({'id':1,'name':'Alice'}, {'user_id':1,'item':'pen'})]
+        """
+        ...
+
+    def left_join(
+        self,
+        other: "Query[U]",
+        left_key: Callable[[T], Any],
+        right_key: Callable[[U], Any] | None = None,
+    ) -> "Query[tuple[T, U | None]]":
+        """Hash left-join — yield ``(left, right)`` for matches, ``(left, None)`` otherwise.
+
+        All rows from *self* are preserved. Rows with no matching key in *other*
+        produce ``(left, None)``.
+
+        Example::
+
+            result = users.left_join(orders, left_key=lambda u: u["id"],
+                                             right_key=lambda o: o["user_id"]).to_list()
+        """
+        ...
+
+    def tee(self, n: int = 2) -> "tuple[Query[T], ...]":
+        """Materialise once and return *n* independent Query copies.
+
+        Example::
+
+            q1, q2, q3 = Query(data).filter(col > 0).tee(3)
+            total  = q1.sum()
+            top10  = q2.sort(reverse=True).take(10).to_list()
+            count  = q3.count()
+        """
+        ...
+
+    def flatten(self) -> "Query[Any]":
+        """Expand each element one level, yielding its items individually.
+
+        Strings are treated as scalars (not character-expanded).
+        Non-iterable elements are passed through unchanged.
+
+        Example::
+
+            Query([[1, 2], [3, 4]]).flatten().to_list()  # [1, 2, 3, 4]
+        """
+        ...
+
+    def partition_by(
+        self, key_fn: Callable[[T], Any] | None = None
+    ) -> "Query[list[T]]":
+        """Group consecutive elements with the same key value into sublists.
+
+        Clojure analogue: ``(partition-by f coll)``.
+        *key_fn* extracts the grouping key; ``None`` compares elements directly.
+
+        Example::
+
+            Query([1, 1, 2, 2, 3, 1, 1]).partition_by().to_list()
+            # [[1, 1], [2, 2], [3], [1, 1]]
+        """
+        ...
+
+    def dedupe(self, key_fn: Callable[[T], Any] | None = None) -> "Query[T]":
+        """Remove *consecutive* duplicate elements (non-consecutive duplicates kept).
+
+        Clojure analogue: ``(dedupe coll)``.
+        *key_fn* extracts the comparison key; ``None`` compares elements directly.
+
+        Example::
+
+            Query([1, 1, 2, 2, 3, 1, 1]).dedupe().to_list()
+            # [1, 2, 3, 1]
+        """
+        ...
+
+    def cycle(self, n: int | None = None) -> "Query[T]":
+        """Repeat the sequence *n* times (or infinitely when ``n`` is ``None``).
+
+        Example::
+
+            Query([1, 2, 3]).cycle(2).to_list()       # [1, 2, 3, 1, 2, 3]
+            Query([1, 2]).cycle().take(5).to_list()   # [1, 2, 1, 2, 1]
+        """
+        ...
+
+    def step_by(self, n: int) -> "Query[T]":
+        """Return every *n*-th element (0, n, 2n, …).
+
+        Example::
+
+            Query(range(10)).step_by(3).to_list()  # [0, 3, 6, 9]
+        """
+        ...
+
+    def interleave(self, other: "Query[U]") -> "Query[T | U]":
+        """Interleave elements from *self* and *other*, stopping at the shorter one.
+
+        Example::
+
+            Query([1, 2, 3]).interleave(Query([10, 20, 30])).to_list()
+            # [1, 10, 2, 20, 3, 30]
+        """
+        ...
+
+    def sample(self, n: int, seed: int | None = None) -> "Query[T]":
+        """Return *n* randomly chosen elements without replacement.
+
+        Example::
+
+            Query(range(100)).sample(5, seed=42).to_list()
+        """
+        ...
+
+    def cache(self) -> "Query[T]":
+        """Materialise the pipeline into an in-memory list and return a new Query.
+
+        Use when the same dataset will be queried multiple times to avoid
+        re-scanning the source on every terminal call.
+
+        Example::
+
+            q = Query(large_data).filter(col > 0).cache()
+            count_above_1 = q.filter(col > 1).count()
+            total         = q.sum()
+        """
+        ...
+
+    def set_field(self, name: str, fn: Callable[[Any], Any]) -> "Query[T]":
+        """Apply ``fn(old_value)`` to field *name* in each dict, returning a modified dict.
+
+        Fields that do not exist receive ``fn(None)``.
+
+        Example::
+
+            Query(products).set_field("price", lambda v: round(v * 1.1, 2))
+        """
+        ...
+
+    def add_field(self, name: str, fn: Callable[[T], Any]) -> "Query[T]":
+        """Add a new field *name = fn(record)* to each dict.
+
+        *fn* receives the whole record and returns the new field value.
+
+        Example::
+
+            Query(orders).add_field("total", lambda r: r["price"] * r["qty"])
+        """
+        ...
+
+    def drop_field(self, *names: str) -> "Query[T]":
+        """Remove the specified fields from each dict.
+
+        Example::
+
+            Query(users).drop_field("password", "token")
+        """
+        ...
+
+    def select(self, *fields: str) -> "Query[T]":
+        """Keep only the specified fields in each dict (others are dropped).
+
+        Fields that do not exist are silently omitted. Field order follows *fields*.
+
+        Example::
+
+            Query(users).select("id", "name").to_list()
+            # [{"id": 1, "name": "Alice"}, ...]
+        """
+        ...
+
+    def rename_field(self, old: str, new: str) -> "Query[T]":
+        """Rename field *old* to *new* in each dict.
+
+        Records that do not contain *old* are passed through unchanged.
+
+        Example::
+
+            Query(records).rename_field("user_id", "id").to_list()
+        """
+        ...
+
+    def value_counts(
+        self, key_fn: Callable[[T], Any] | None = None
+    ) -> dict[Any, int]:
+        """Count occurrences of each element (or key) and return ``{value: count}``.
+
+        *key_fn* extracts the counting key; ``None`` uses the element itself.
+
+        Example::
+
+            Query(["a", "b", "a"]).value_counts()         # {"a": 2, "b": 1}
+            Query(records).value_counts(lambda r: r["status"])
+        """
+        ...
+
+    def sliding_window(self, n: int) -> "Query[tuple[T, ...]]":
+        """Yield overlapping tuples of *n* consecutive elements.
+
+        Produces ``max(0, len - n + 1)`` windows.  Fewer than *n* elements yields
+        an empty Query.
+
+        Example::
+
+            Query([1, 2, 3, 4]).sliding_window(2).to_list()
+            # [(1, 2), (2, 3), (3, 4)]
+        """
         ...
 
     def enumerate(self) -> Query[tuple[int, T]]:
@@ -339,9 +754,10 @@ class Query(Generic[T]):
     def to_numpy(self) -> Any:
         """Materialise the pipeline into a numpy ndarray (no per-element boxing).
 
-        Transfers the Rust ``Vec`` buffer directly to numpy — no extra copy
-        and no Python float/int boxing.  Equivalent to ``to_bytes()`` +
-        ``np.frombuffer()`` but returns a writable, owned array.
+        Imports numpy only when this method is called; ZPyFlow itself does not
+        depend on the Python numpy package for import/build.  Numeric values are
+        transferred as raw bytes, avoiding Python float/int boxing, then copied
+        once to return a writable, owned array.
 
         Dtype mapping:
 
@@ -350,7 +766,7 @@ class Query(Generic[T]):
         =============  ==========
         f64            float64
         i64            int64
-        u8             uint8
+        u8             int64 after pending numeric ops
         =============  ==========
 
         Raises ``ValueError`` for object/Py pipelines.  Use
@@ -360,7 +776,7 @@ class Query(Generic[T]):
 
             import numpy as np
             arr = Query(data).filter(col > 0).map(col * 2).to_numpy()
-            # arr is a writable np.ndarray[float64], zero extra copies
+            # arr is a writable np.ndarray[float64]
         """
         ...
 

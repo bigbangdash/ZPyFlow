@@ -2,8 +2,8 @@
 Source adapters — convert external data formats into ZPyFlow Query objects.
 
 Each adapter is a thin shim that normalizes data into a form the Rust core
-understands (list[float], list[int], or list[Any]).  Zero-copy is used where
-the format allows it (numpy f64 arrays go directly; others are converted once).
+understands (list[float], list[int], or list[Any]).  Buffer-protocol fast paths
+are used where the format allows it; other inputs are converted once.
 
 CSV / JSON Lines parsing routes through the Rust core (GIL-free for path
 inputs; GIL-free parse after a one-time read for file-like inputs).
@@ -65,8 +65,8 @@ def from_arrow(table_or_array: Any) -> Query:
     """
     Create a Query from a PyArrow Array, ChunkedArray, or Table column.
 
-    For null-free float64/int64 arrays, reads via the buffer protocol:
-    numpy view (zero-copy for float64) → GIL-free memcpy into Rust Vec.
+    For null-free float64/int64 arrays, reads the Arrow data buffer via the
+    buffer protocol: Arrow buffer → memoryview → GIL-free memcpy into Rust Vec.
 
     Float64 arrays with nulls are supported: nulls become ``NaN`` (IEEE 754).
     Filter them out with ``filter(col == col)`` or ``filter(col.between(lo, hi))``.
@@ -81,24 +81,36 @@ def from_arrow(table_or_array: Any) -> Query:
     if isinstance(table_or_array, pa.Table):
         return Query(table_or_array.to_pylist())
 
+    def data_view(array: Any, format_code: str, byte_width: int) -> memoryview:
+        buf = array.buffers()[1]
+        if buf is None:
+            return memoryview(b"").cast(format_code)
+        start = array.offset * byte_width
+        end = start + len(array) * byte_width
+        return memoryview(buf)[start:end].cast(format_code)
+
     arr = table_or_array
     if hasattr(arr, "combine_chunks"):
         arr = arr.combine_chunks()  # ChunkedArray → Array
 
     py_type = arr.type
 
-    # Fast path: null-free numeric → numpy view → buffer protocol + GIL-free memcpy
+    # Fast path: null-free numeric → Arrow data buffer → buffer protocol + GIL-free memcpy
     if arr.null_count == 0:
         if pa.types.is_float64(py_type):
-            # to_numpy() is zero-copy for null-free float64 arrays
-            return Query._from_buffer_f64(arr.to_numpy())
+            return Query._from_buffer_f64(data_view(arr, "d", 8))
         if pa.types.is_floating(py_type):
-            return Query._from_buffer_f64(arr.cast(pa.float64()).to_numpy())
+            arr = arr.cast(pa.float64())
+            return Query._from_buffer_f64(data_view(arr, "d", 8))
         if pa.types.is_integer(py_type):
-            return Query._from_buffer_i64(arr.cast(pa.int64()).to_numpy())
+            arr = arr.cast(pa.int64())
+            return Query._from_buffer_i64(data_view(arr, "q", 8))
     elif pa.types.is_float64(py_type):
         # Nulls become NaN; filter with col == col or col.between(...) as needed
-        return Query._from_buffer_f64(arr.to_numpy(zero_copy_only=False))
+        import pyarrow.compute as pc
+
+        arr = pc.fill_null(arr, float("nan"))
+        return Query._from_buffer_f64(data_view(arr, "d", 8))
 
     return Query(arr.to_pylist())
 
