@@ -2,7 +2,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Usage:
 #   make help          — show this help
-#   make build         — build the Rust extension locally (requires maturin)
+#   make build         — build with thin LTO (low-RAM; for testing)
+#   make build-full    — build with fat LTO (full release; for benchmarks)
 #   make test          — run Python tests locally
 #   make bench         — run all Python benchmarks locally
 #
@@ -15,7 +16,7 @@
 # Docker Compose targets mirror the local targets with the dc- prefix.
 
 .DEFAULT_GOAL := help
-.PHONY: help build test bench bench-rust lint fmt audit clean \
+.PHONY: help build build-full build-debug test test-fast bench bench-rust lint fmt audit clean \
         docs docs-serve docs-deploy \
         dc-build dc-test dc-bench dc-bench-rust dc-shell dc-clean \
         dc-bench-filter dc-bench-chained dc-bench-numpy dc-bench-agg dc-bench-objects \
@@ -32,34 +33,37 @@ help:  ## Show this help message
 
 # ── Local targets (requires Rust + maturin installed on host) ─────────────────
 
-build:  ## Build the Rust extension in release mode
+build:  ## Build with thin LTO — optimised but low-RAM (~1/4 of full release)
+	maturin develop --profile dev-release
+
+build-full:  ## Build with fat LTO — full release mode (benchmarks / pre-release)
 	maturin develop --release
 
-build-debug:  ## Build in debug mode (faster compile, slower runtime)
+build-debug:  ## Build in debug mode (fastest compile, unoptimised)
 	maturin develop
 
-test: build  ## Run Python unit tests
+test: build  ## Run Python unit tests (thin-LTO build)
 	pytest tests/ -v --tb=short
 
-test-fast: build  ## Run tests without verbose output
+test-fast: build  ## Run tests without verbose output (thin-LTO build)
 	pytest tests/ -q
 
-bench: build  ## Run all Python benchmark suites
+bench: build-full  ## Run all Python benchmark suites (fat-LTO build for accurate numbers)
 	python sandbox/benchmark/run.py --suite all
 
-bench-filter: build  ## Run filter benchmarks
+bench-filter: build-full  ## Run filter benchmarks
 	python sandbox/benchmark/run.py --suite filter
 
-bench-chained: build  ## Run chained pipeline benchmarks
+bench-chained: build-full  ## Run chained pipeline benchmarks
 	python sandbox/benchmark/run.py --suite chained
 
-bench-numpy: build  ## Run numpy comparison benchmarks
+bench-numpy: build-full  ## Run numpy comparison benchmarks
 	python sandbox/benchmark/run.py --suite vs_numpy
 
-bench-agg: build  ## Run aggregation benchmarks
+bench-agg: build-full  ## Run aggregation benchmarks
 	python sandbox/benchmark/run.py --suite aggregation
 
-bench-objects: build  ## Run Python object benchmarks
+bench-objects: build-full  ## Run Python object benchmarks
 	python sandbox/benchmark/run.py --suite objects
 
 bench-rust:  ## Run Criterion (Rust) benchmarks
@@ -68,10 +72,10 @@ bench-rust:  ## Run Criterion (Rust) benchmarks
 bench-rust-simd:  ## Run SIMD selectivity benchmarks
 	cargo bench --bench simd_filter
 
-bench-save: build  ## Save current results as baseline
+bench-save: build-full  ## Save current results as baseline
 	SUITE=$${SUITE:-filter} python sandbox/benchmark/run.py --suite $${SUITE} --save
 
-bench-compare: build  ## Compare against saved baseline (fails if >10% regression)
+bench-compare: build-full  ## Compare against saved baseline (fails if >10% regression)
 	SUITE=$${SUITE:-filter} python sandbox/benchmark/run.py --suite $${SUITE} --compare
 
 lint:  ## Run Rust linter
