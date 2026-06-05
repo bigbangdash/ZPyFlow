@@ -23,7 +23,8 @@ Demonstrates ZPyFlow's core API and how it connects to common libraries.
 | [`05_log_processing.py`](05_log_processing.py) | Access logs, error rates, latency stats | `GroupBy`, Counter, rolling windows |
 | [`06_etl_pipeline.py`](06_etl_pipeline.py) | Extract → Transform → Load with CSV/JSON | `from_csv`, `from_json_lines`, throughput |
 | [`07_ai_embeddings.py`](07_ai_embeddings.py) | Vector search, batch inference, top-p sampling | `from_numpy`, f64 fast path for ML |
-| [`08_parallel_and_performance.py`](08_parallel_and_performance.py) | Parallel vs single-thread, memory, profiling | `.parallel()`, timing patterns |
+| [`08_parallel_and_performance.py`](08_parallel_and_performance.py) | Parallel vs single-thread, memory, cache/tee | `.parallel()`, `.cache()`, `.tee()` |
+| [`09_sequence_tools.py`](09_sequence_tools.py) | Sequence tools and infinite generators | `cycle`, `step_by`, `interleave`, `sample`, `iterate`, `repeat`, `repeatedly`, `flatten`, `dedupe`, `partition_by` |
 
 ---
 
