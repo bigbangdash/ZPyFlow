@@ -744,6 +744,42 @@ class Query(Generic[T]):
         ...
 
     # ------------------------------------------------------------------
+    # Convenience methods (spec-077)
+    # ------------------------------------------------------------------
+
+    def filter_map(self, fn: Callable[[T], U | None]) -> "Query[U]":
+        """Apply *fn* to each element; keep only non-``None`` results."""
+        ...
+
+    def tap(self, fn: Callable[[T], Any]) -> "Query[T]":
+        """Call *fn* on each element for side effects; pass elements through."""
+        ...
+
+    def compact(self, falsy: bool = False) -> "Query[T]":
+        """Remove ``None`` values (default) or all falsy values when *falsy=True*."""
+        ...
+
+    def min_by(self, key_fn: Callable[[T], Any]) -> T | None:
+        """Return the element for which *key_fn* is smallest, or ``None`` if empty."""
+        ...
+
+    def max_by(self, key_fn: Callable[[T], Any]) -> T | None:
+        """Return the element for which *key_fn* is largest, or ``None`` if empty."""
+        ...
+
+    def unzip(self) -> tuple[list[Any], list[Any]]:
+        """Split a stream of ``(a, b)`` tuples into ``([a…], [b…])``."""
+        ...
+
+    def median(self) -> float | None:
+        """Return the median value, or ``None`` if empty."""
+        ...
+
+    def product(self) -> float:
+        """Return the product of all elements (1 for empty pipeline)."""
+        ...
+
+    # ------------------------------------------------------------------
     # Terminal operations
     # ------------------------------------------------------------------
 

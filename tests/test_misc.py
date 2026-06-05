@@ -222,3 +222,115 @@ class TestCycleStepInterleave:
     def test_sample_too_large(self):
         with pytest.raises(ValueError):
             Query([1, 2, 3]).sample(5)
+
+
+class TestConvenienceMethods:
+    """filter_map / tap / compact / min_by / max_by / unzip / median / product"""
+
+    # filter_map
+    def test_filter_map_drops_none(self):
+        result = Query(["1", "x", "3", "y"]).filter_map(
+            lambda s: int(s) if s.isdigit() else None
+        ).to_list()
+        assert result == [1, 3]
+
+    def test_filter_map_all_none(self):
+        assert Query([1, 2, 3]).filter_map(lambda _: None).to_list() == []
+
+    def test_filter_map_none_kept(self):
+        assert Query([1, 2, 3]).filter_map(lambda x: x * 2).to_list() == [2, 4, 6]
+
+    def test_filter_map_empty(self):
+        assert Query([]).filter_map(lambda x: x).to_list() == []
+
+    # tap
+    def test_tap_passes_through(self):
+        seen = []
+        result = Query([1, 2, 3]).tap(seen.append).to_list()
+        assert result == [1, 2, 3]
+        assert seen == [1, 2, 3]
+
+    def test_tap_chained(self):
+        log = []
+        total = Query([1.0, 2.0, 3.0]).tap(log.append).filter(col > 1).sum()
+        assert total == 5.0
+        assert len(log) == 3  # tap sees all elements before filter
+
+    # compact
+    def test_compact_removes_none(self):
+        assert Query([1, None, 2, None, 3]).compact().to_list() == [1, 2, 3]
+
+    def test_compact_falsy_mode(self):
+        assert Query([1, 0, 2, "", 3, False]).compact(falsy=True).to_list() == [1, 2, 3]
+
+    def test_compact_empty(self):
+        assert Query([]).compact().to_list() == []
+
+    def test_compact_all_none(self):
+        assert Query([None, None]).compact().to_list() == []
+
+    def test_compact_keeps_zero_by_default(self):
+        assert Query([0, None, 1]).compact().to_list() == [0, 1]
+
+    # min_by / max_by
+    def test_min_by_dict(self):
+        records = [{"v": 3}, {"v": 1}, {"v": 2}]
+        assert Query(records).min_by(lambda r: r["v"]) == {"v": 1}
+
+    def test_max_by_dict(self):
+        records = [{"v": 3}, {"v": 1}, {"v": 2}]
+        assert Query(records).max_by(lambda r: r["v"]) == {"v": 3}
+
+    def test_min_by_empty(self):
+        assert Query([]).min_by(lambda x: x) is None
+
+    def test_max_by_empty(self):
+        assert Query([]).max_by(lambda x: x) is None
+
+    def test_min_by_single(self):
+        assert Query([{"v": 5}]).min_by(lambda r: r["v"]) == {"v": 5}
+
+    # unzip
+    def test_unzip_pairs(self):
+        lefts, rights = Query([(1, "a"), (2, "b"), (3, "c")]).unzip()
+        assert lefts == [1, 2, 3]
+        assert rights == ["a", "b", "c"]
+
+    def test_unzip_empty(self):
+        lefts, rights = Query([]).unzip()
+        assert lefts == [] and rights == []
+
+    def test_unzip_after_zip(self):
+        a = [1, 2, 3]
+        b = [4, 5, 6]
+        la, lb = Query(a).zip(Query(b)).unzip()
+        assert la == a and lb == b
+
+    # median
+    def test_median_odd(self):
+        assert Query([3.0, 1.0, 4.0, 1.0, 5.0]).median() == 3.0
+
+    def test_median_even(self):
+        assert Query([1.0, 2.0, 3.0, 4.0]).median() == 2.5
+
+    def test_median_single(self):
+        assert Query([7.0]).median() == 7.0
+
+    def test_median_empty(self):
+        assert Query([]).median() is None
+
+    def test_median_sorted_already(self):
+        assert Query([1, 2, 3, 4, 5]).median() == 3
+
+    # product
+    def test_product_integers(self):
+        assert Query([1, 2, 3, 4]).product() == 24
+
+    def test_product_floats(self):
+        assert Query([2.0, 0.5, 4.0]).product() == 4.0
+
+    def test_product_empty(self):
+        assert Query([]).product() == 1
+
+    def test_product_with_zero(self):
+        assert Query([1, 2, 0, 3]).product() == 0

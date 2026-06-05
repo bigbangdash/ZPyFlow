@@ -831,6 +831,160 @@ Query.group_agg = _query_group_agg
 
 
 # ---------------------------------------------------------------------------
+# Convenience methods (spec-077)
+# ---------------------------------------------------------------------------
+
+def _query_filter_map(self, fn):
+    """Apply *fn* to each element and keep only non-None results.
+
+    Equivalent to ``.map(fn).filter(lambda x: x is not None)`` but in one pass.
+
+    Example::
+
+        Query(records).filter_map(lambda r: r.get("price")).to_list()
+        Query(["1", "two", "3"]).filter_map(lambda s: int(s) if s.isdigit() else None).to_list()
+        # [1, 3]
+    """
+    result = []
+    for item in self:
+        val = fn(item)
+        if val is not None:
+            result.append(val)
+    return Query(result)
+
+
+def _query_tap(self, fn):
+    """Call *fn* on each element for side effects; pass elements through unchanged.
+
+    Useful for logging or debugging mid-pipeline without breaking the chain.
+
+    Example::
+
+        import logging
+        Query(data).filter(col > 0).tap(lambda x: logging.debug(x)).map(col * 2).to_list()
+    """
+    result = []
+    for item in self:
+        fn(item)
+        result.append(item)
+    return Query(result)
+
+
+def _query_compact(self, falsy: bool = False):
+    """Remove ``None`` values (default) or all falsy values when *falsy=True*.
+
+    Example::
+
+        Query([1, None, 2, None, 3]).compact().to_list()         # [1, 2, 3]
+        Query([1, 0, 2, "", 3, False]).compact(falsy=True).to_list()  # [1, 2, 3]
+    """
+    if falsy:
+        return Query([item for item in self if item])
+    return Query([item for item in self if item is not None])
+
+
+def _query_min_by(self, key_fn):
+    """Return the element for which *key_fn* is smallest, or ``None`` if empty.
+
+    Does **not** materialise the full list — uses a single linear scan.
+
+    Example::
+
+        Query(records).min_by(lambda r: r["price"])   # cheapest record
+        Query(records).min_by(lambda r: r["latency_ms"])
+    """
+    best = _SENTINEL
+    best_key = None
+    for item in self:
+        k = key_fn(item)
+        if best is _SENTINEL or k < best_key:
+            best = item
+            best_key = k
+    return None if best is _SENTINEL else best
+
+
+def _query_max_by(self, key_fn):
+    """Return the element for which *key_fn* is largest, or ``None`` if empty.
+
+    Does **not** materialise the full list — uses a single linear scan.
+
+    Example::
+
+        Query(records).max_by(lambda r: r["score"])   # highest-score record
+    """
+    best = _SENTINEL
+    best_key = None
+    for item in self:
+        k = key_fn(item)
+        if best is _SENTINEL or k > best_key:
+            best = item
+            best_key = k
+    return None if best is _SENTINEL else best
+
+
+def _query_unzip(self):
+    """Split a stream of ``(a, b)`` tuples into two lists ``([a...], [b...])``.
+
+    Returns a tuple of two plain Python lists.
+
+    Example::
+
+        lefts, rights = Query(users).inner_join(orders, "id").unzip()
+        keys, values  = Query(d.items()).unzip()
+    """
+    lefts, rights = [], []
+    for item in self:
+        lefts.append(item[0])
+        rights.append(item[1])
+    return lefts, rights
+
+
+def _query_median(self):
+    """Return the median value, or ``None`` if the pipeline is empty.
+
+    Materialises the pipeline to sort. For even-length sequences returns
+    the average of the two middle values.
+
+    Example::
+
+        Query([3.0, 1.0, 4.0, 1.0, 5.0]).median()   # 3.0
+    """
+    data = list(self)
+    n = len(data)
+    if n == 0:
+        return None
+    data.sort()
+    mid = n // 2
+    if n % 2 == 1:
+        return data[mid]
+    return (data[mid - 1] + data[mid]) / 2
+
+
+def _query_product(self):
+    """Return the product of all elements (1 for empty pipeline).
+
+    Example::
+
+        Query([1, 2, 3, 4]).product()   # 24
+        Query([2.0, 0.5, 3.0]).product()  # 3.0
+    """
+    result = 1
+    for item in self:
+        result *= item
+    return result
+
+
+Query.filter_map = _query_filter_map
+Query.tap        = _query_tap
+Query.compact    = _query_compact
+Query.min_by     = _query_min_by
+Query.max_by     = _query_max_by
+Query.unzip      = _query_unzip
+Query.median     = _query_median
+Query.product    = _query_product
+
+
+# ---------------------------------------------------------------------------
 # Extended aggregation helpers — for use with GroupBy.agg()
 # ---------------------------------------------------------------------------
 
@@ -930,4 +1084,5 @@ __all__ = [
     "from_json_lines",
     "from_generator",
     "__version__",
+    # convenience methods are on Query; no standalone exports needed
 ]

@@ -124,6 +124,35 @@ Query(["a", "b", "a", "c", "a"]).value_counts()
 # {"a": 3, "b": 1, "c": 1}
 ```
 
+### Convenience methods
+
+| Method | Description |
+|---|---|
+| `.filter_map(fn)` | Apply `fn`; drop elements where `fn` returns `None` — one-pass filter+map |
+| `.tap(fn)` | Call `fn` for side effects (logging, debug) without interrupting the pipeline |
+| `.compact(falsy=False)` | Remove `None` values; pass `falsy=True` to also drop `0`, `""`, `False` |
+| `.min_by(key_fn)` | Element for which `key_fn` is smallest; `None` if empty (single linear scan) |
+| `.max_by(key_fn)` | Element for which `key_fn` is largest; `None` if empty (single linear scan) |
+| `.unzip()` | Split `(a, b)` tuples into `([a…], [b…])` — useful after `inner_join` / `zip` |
+| `.median()` | Median value, or `None` if empty (materialises to sort) |
+| `.product()` | Product of all elements (1 for empty pipeline) |
+
+```python
+# filter_map: parse integers, skip non-numeric strings
+Query(["1", "x", "3"]).filter_map(lambda s: int(s) if s.isdigit() else None).to_list()
+# [1, 3]
+
+# tap: log mid-pipeline without breaking the chain
+Query(data).filter(col > 0).tap(lambda x: print(x)).map(col * 2).to_list()
+
+# min_by / max_by: find the record, not just the value
+Query(products).min_by(lambda p: p["price"])  # cheapest product record
+Query(products).max_by(lambda p: p["rating"]) # highest-rated product record
+
+# unzip: split join results into two separate lists
+users, orders = Query(users).inner_join(orders, "id").unzip()
+```
+
 ### Terminal operations
 
 | Method | Description |
