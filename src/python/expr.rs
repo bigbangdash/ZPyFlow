@@ -2,8 +2,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
 
-use crate::pipeline::numeric::NumericOp;
-use crate::pipeline::obj::{ObjOp, RustValue};
+use crate::core::NumericOp;
+use crate::core::{ObjOp, RustValue};
 
 // ---------------------------------------------------------------------------
 // FieldExpr DSL — object pipeline equivalent of col/Expr
@@ -64,6 +64,40 @@ impl PyFieldExpr {
             op: Some(ObjOp::FilterFieldBetween(Arc::clone(&self.name), lo, hi)),
         }
     }
+
+    /// `field("name").startswith("prefix")`
+    fn startswith(&self, prefix: &str) -> Self {
+        PyFieldExpr {
+            name: Arc::clone(&self.name),
+            op: Some(ObjOp::StrStartsWith(Arc::clone(&self.name), Arc::from(prefix))),
+        }
+    }
+
+    /// `field("name").endswith("suffix")`
+    fn endswith(&self, suffix: &str) -> Self {
+        PyFieldExpr {
+            name: Arc::clone(&self.name),
+            op: Some(ObjOp::StrEndsWith(Arc::clone(&self.name), Arc::from(suffix))),
+        }
+    }
+
+    /// `field("name").contains("sub")`
+    fn contains(&self, sub: &str) -> Self {
+        PyFieldExpr {
+            name: Arc::clone(&self.name),
+            op: Some(ObjOp::StrContains(Arc::clone(&self.name), Arc::from(sub))),
+        }
+    }
+
+    /// `field("name").matches(r"^\d+")`  — full regex match
+    fn matches(&self, pattern: &str) -> PyResult<Self> {
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(PyFieldExpr {
+            name: Arc::clone(&self.name),
+            op: Some(ObjOp::StrMatches(Arc::clone(&self.name), Arc::new(re))),
+        })
+    }
     fn __repr__(&self) -> String {
         format!("FieldExpr(\"{}\")", self.name)
     }
@@ -106,7 +140,10 @@ pub(crate) enum ExprOp {
     Eq(f64),
     Ne(f64),
     Between(f64, f64),
-    SelfEq, // col == col: passes when NOT NaN (arrow null-drop pattern)
+    SelfEq,    // col == col: passes when NOT NaN (arrow null-drop pattern)
+    IsNan,     // only NaN passes
+    IsFinite,  // only finite values pass
+    IsInf,     // only ±infinity passes
     // Scalar transforms
     MulScalar(f64),
     AddScalar(f64),
@@ -121,6 +158,15 @@ pub(crate) enum ExprOp {
     Ceil,
     Round,
     Reciprocal,
+    Log,
+    Log2,
+    Log10,
+    Exp,
+    Sigmoid,
+    // Binary maps
+    Clamp(f64, f64),
+    Mod(f64),
+    FloorDiv(f64),
 }
 
 impl ExprOp {
@@ -134,6 +180,9 @@ impl ExprOp {
             ExprOp::Ne(t) => NumericOp::FilterNe(*t),
             ExprOp::Between(lo, hi) => NumericOp::FilterBetween(*lo, *hi),
             ExprOp::SelfEq => NumericOp::FilterNotNan,
+            ExprOp::IsNan => NumericOp::FilterNan,
+            ExprOp::IsFinite => NumericOp::FilterFinite,
+            ExprOp::IsInf => NumericOp::FilterInf,
             ExprOp::MulScalar(s) => NumericOp::MapMulScalar(*s),
             ExprOp::AddScalar(s) => NumericOp::MapAddScalar(*s),
             ExprOp::SubScalar(s) => NumericOp::MapSubScalar(*s),
@@ -146,6 +195,14 @@ impl ExprOp {
             ExprOp::Ceil => NumericOp::MapCeil,
             ExprOp::Round => NumericOp::MapRound,
             ExprOp::Reciprocal => NumericOp::MapReciprocal,
+            ExprOp::Log => NumericOp::MapLog,
+            ExprOp::Log2 => NumericOp::MapLog2,
+            ExprOp::Log10 => NumericOp::MapLog10,
+            ExprOp::Exp => NumericOp::MapExp,
+            ExprOp::Sigmoid => NumericOp::MapSigmoid,
+            ExprOp::Clamp(lo, hi) => NumericOp::MapClamp(*lo, *hi),
+            ExprOp::Mod(s) => NumericOp::MapMod(*s),
+            ExprOp::FloorDiv(s) => NumericOp::MapFloorDiv(*s),
         })
     }
 
@@ -177,6 +234,9 @@ impl PyExpr {
             ExprOp::Ne(t) => (val != *t).into_py(py),
             ExprOp::Between(lo, hi) => (val >= *lo && val <= *hi).into_py(py),
             ExprOp::SelfEq => (val == val).into_py(py),
+            ExprOp::IsNan => val.is_nan().into_py(py),
+            ExprOp::IsFinite => val.is_finite().into_py(py),
+            ExprOp::IsInf => val.is_infinite().into_py(py),
             ExprOp::MulScalar(s) => (val * s).into_py(py),
             ExprOp::AddScalar(s) => (val + s).into_py(py),
             ExprOp::SubScalar(s) => (val - s).into_py(py),
@@ -189,8 +249,39 @@ impl PyExpr {
             ExprOp::Ceil => val.ceil().into_py(py),
             ExprOp::Round => val.round().into_py(py),
             ExprOp::Reciprocal => (1.0 / val).into_py(py),
+            ExprOp::Log => val.ln().into_py(py),
+            ExprOp::Log2 => val.log2().into_py(py),
+            ExprOp::Log10 => val.log10().into_py(py),
+            ExprOp::Exp => val.exp().into_py(py),
+            ExprOp::Sigmoid => (1.0 / (1.0 + (-val).exp())).into_py(py),
+            ExprOp::Clamp(lo, hi) => val.clamp(*lo, *hi).into_py(py),
+            ExprOp::Mod(s) => (val % s).into_py(py),
+            ExprOp::FloorDiv(s) => (val / s).floor().into_py(py),
         }
     }
+}
+
+// Helper macro: add scalar/unary methods to both PyExpr and PyColProxy
+// (not used yet — methods are added manually for clarity)
+
+impl PyExpr {
+    fn unary(op: ExprOp) -> Self { PyExpr { op } }
+}
+
+#[pymethods]
+impl PyExpr {
+    fn __mod__(&self, other: f64) -> Self { PyExpr { op: ExprOp::Mod(other) } }
+    fn __floordiv__(&self, other: f64) -> Self { PyExpr { op: ExprOp::FloorDiv(other) } }
+    fn is_nan(&self) -> Self { PyExpr { op: ExprOp::IsNan } }
+    fn not_nan(&self) -> Self { PyExpr { op: ExprOp::SelfEq } }
+    fn is_finite(&self) -> Self { PyExpr { op: ExprOp::IsFinite } }
+    fn is_inf(&self) -> Self { PyExpr { op: ExprOp::IsInf } }
+    fn log(&self) -> Self { PyExpr::unary(ExprOp::Log) }
+    fn log2(&self) -> Self { PyExpr::unary(ExprOp::Log2) }
+    fn log10(&self) -> Self { PyExpr::unary(ExprOp::Log10) }
+    fn exp(&self) -> Self { PyExpr::unary(ExprOp::Exp) }
+    fn sigmoid(&self) -> Self { PyExpr::unary(ExprOp::Sigmoid) }
+    fn clamp(&self, lo: f64, hi: f64) -> Self { PyExpr::unary(ExprOp::Clamp(lo, hi)) }
 }
 
 /// Factory: `field("price") > 100.0` → `FieldExpr` with an embedded `ObjOp`.
@@ -290,11 +381,19 @@ impl PyColProxy {
     fn round(&self) -> PyExpr {
         PyExpr { op: ExprOp::Round }
     }
-    fn reciprocal(&self) -> PyExpr {
-        PyExpr {
-            op: ExprOp::Reciprocal,
-        }
-    }
+    fn reciprocal(&self) -> PyExpr { PyExpr { op: ExprOp::Reciprocal } }
+    fn __mod__(&self, other: f64) -> PyExpr { PyExpr { op: ExprOp::Mod(other) } }
+    fn __floordiv__(&self, other: f64) -> PyExpr { PyExpr { op: ExprOp::FloorDiv(other) } }
+    fn is_nan(&self) -> PyExpr { PyExpr { op: ExprOp::IsNan } }
+    fn not_nan(&self) -> PyExpr { PyExpr { op: ExprOp::SelfEq } }
+    fn is_finite(&self) -> PyExpr { PyExpr { op: ExprOp::IsFinite } }
+    fn is_inf(&self) -> PyExpr { PyExpr { op: ExprOp::IsInf } }
+    fn log(&self) -> PyExpr { PyExpr { op: ExprOp::Log } }
+    fn log2(&self) -> PyExpr { PyExpr { op: ExprOp::Log2 } }
+    fn log10(&self) -> PyExpr { PyExpr { op: ExprOp::Log10 } }
+    fn exp(&self) -> PyExpr { PyExpr { op: ExprOp::Exp } }
+    fn sigmoid(&self) -> PyExpr { PyExpr { op: ExprOp::Sigmoid } }
+    fn clamp(&self, lo: f64, hi: f64) -> PyExpr { PyExpr { op: ExprOp::Clamp(lo, hi) } }
 }
 
 /// Python scalar → RustValue.  Nested lists/dicts become Null (unsupported).
@@ -375,5 +474,21 @@ fn obj_op_passes_py_dict(dict: &Bound<'_, PyDict>, op: &ObjOp) -> PyResult<bool>
                 RustValue::Str(s) => v.extract::<&str>().map(|x| x != s.as_ref()).unwrap_or(true),
             })
         }
+        ObjOp::StrStartsWith(f, prefix) => Ok(dict
+            .get_item(f.as_ref())?
+            .and_then(|v| v.extract::<String>().ok())
+            .map_or(false, |s| s.starts_with(prefix.as_ref()))),
+        ObjOp::StrEndsWith(f, suffix) => Ok(dict
+            .get_item(f.as_ref())?
+            .and_then(|v| v.extract::<String>().ok())
+            .map_or(false, |s| s.ends_with(suffix.as_ref()))),
+        ObjOp::StrContains(f, sub) => Ok(dict
+            .get_item(f.as_ref())?
+            .and_then(|v| v.extract::<String>().ok())
+            .map_or(false, |s| s.contains(sub.as_ref()))),
+        ObjOp::StrMatches(f, re) => Ok(dict
+            .get_item(f.as_ref())?
+            .and_then(|v| v.extract::<String>().ok())
+            .map_or(false, |s| re.is_match(&s))),
     }
 }

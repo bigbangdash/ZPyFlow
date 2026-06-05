@@ -14,7 +14,7 @@
 //! variable.  We use a write-pointer approach: write into a pre-allocated
 //! output buffer and track how many elements were written.
 
-use crate::pipeline::numeric::NumericOp;
+use super::pipeline::NumericOp;
 use wide::{f32x8, f64x4, i64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt};
 
 // ---------------------------------------------------------------------------
@@ -117,6 +117,14 @@ fn to_map_op(op: &NumericOp) -> Option<MapOp> {
         NumericOp::MapRound => Some(MapOp::Round),
         NumericOp::MapPowScalar(s) => Some(MapOp::Pow(*s)),
         NumericOp::MapReciprocal => Some(MapOp::Reciprocal),
+        NumericOp::MapLog => Some(MapOp::Log),
+        NumericOp::MapLog2 => Some(MapOp::Log2),
+        NumericOp::MapLog10 => Some(MapOp::Log10),
+        NumericOp::MapExp => Some(MapOp::Exp),
+        NumericOp::MapSigmoid => Some(MapOp::Sigmoid),
+        NumericOp::MapClamp(lo, hi) => Some(MapOp::Clamp(*lo, *hi)),
+        NumericOp::MapMod(s) => Some(MapOp::Mod(*s)),
+        NumericOp::MapFloorDiv(s) => Some(MapOp::FloorDiv(*s)),
         _ => None,
     }
 }
@@ -138,6 +146,14 @@ enum MapOp {
     Round,
     Pow(f64),
     Reciprocal,
+    Log,
+    Log2,
+    Log10,
+    Exp,
+    Sigmoid,
+    Clamp(f64, f64),
+    Mod(f64),
+    FloorDiv(f64),
 }
 
 /// Apply a batch of map operations in-place using SIMD.
@@ -156,6 +172,14 @@ fn flush_maps(data: &mut Vec<f64>, maps: &[MapOp]) {
             MapOp::Round => simd_map_round_inplace(data),
             MapOp::Pow(s) => simd_map_pow_inplace(data, *s),
             MapOp::Reciprocal => simd_map_reciprocal_inplace(data),
+            MapOp::Log => { for v in data.iter_mut() { *v = v.ln(); } }
+            MapOp::Log2 => { for v in data.iter_mut() { *v = v.log2(); } }
+            MapOp::Log10 => { for v in data.iter_mut() { *v = v.log10(); } }
+            MapOp::Exp => { for v in data.iter_mut() { *v = v.exp(); } }
+            MapOp::Sigmoid => { for v in data.iter_mut() { *v = 1.0 / (1.0 + (-*v).exp()); } }
+            MapOp::Clamp(lo, hi) => { for v in data.iter_mut() { *v = v.clamp(*lo, *hi); } }
+            MapOp::Mod(s) => { for v in data.iter_mut() { *v %= s; } }
+            MapOp::FloorDiv(s) => { for v in data.iter_mut() { *v = (*v / s).floor(); } }
         }
     }
 }
@@ -1285,6 +1309,106 @@ simd_filter_min_fn!(simd_filter_min_lt, cmp_lt, <);
 simd_filter_min_fn!(simd_filter_min_le, cmp_le, <=);
 
 // ---------------------------------------------------------------------------
+// SIMD fused filter+stats — count + sum + min + max, no intermediate Vec
+// ---------------------------------------------------------------------------
+
+macro_rules! simd_filter_stats_fn {
+    ($name:ident, $cmp_method:ident, $scalar_op:tt) => {
+        pub fn $name(data: &[f64], threshold: f64) -> Option<(usize, f64, f64, f64)> {
+            let thresh = f64x4::splat(threshold);
+            let mut sum_v = f64x4::ZERO;
+            let mut min_v = f64x4::splat(f64::INFINITY);
+            let mut max_v = f64x4::splat(f64::NEG_INFINITY);
+            let mut count = 0usize;
+            let (left, right) = data.split_at(data.len() / 4 * 4);
+
+            for chunk in left.chunks_exact(4) {
+                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = v.$cmp_method(thresh);
+                let mask_bits = mask.move_mask();
+                if mask_bits != 0 {
+                    count += mask_bits.count_ones() as usize;
+                    sum_v += mask.blend(v, f64x4::ZERO);
+                    min_v = min_v.min(mask.blend(v, f64x4::splat(f64::INFINITY)));
+                    max_v = max_v.max(mask.blend(v, f64x4::splat(f64::NEG_INFINITY)));
+                }
+            }
+
+            let sum_arr: [f64; 4] = sum_v.into();
+            let min_arr: [f64; 4] = min_v.into();
+            let max_arr: [f64; 4] = max_v.into();
+            let mut sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+            let mut min = min_arr[0].min(min_arr[1]).min(min_arr[2]).min(min_arr[3]);
+            let mut max = max_arr[0].max(max_arr[1]).max(max_arr[2]).max(max_arr[3]);
+
+            for &x in right {
+                if x $scalar_op threshold {
+                    count += 1;
+                    sum += x;
+                    min = min.min(x);
+                    max = max.max(x);
+                }
+            }
+
+            if count == 0 {
+                None
+            } else {
+                Some((count, sum, min, max))
+            }
+        }
+    };
+}
+
+simd_filter_stats_fn!(simd_filter_stats_gt, cmp_gt, >);
+simd_filter_stats_fn!(simd_filter_stats_ge, cmp_ge, >=);
+simd_filter_stats_fn!(simd_filter_stats_lt, cmp_lt, <);
+simd_filter_stats_fn!(simd_filter_stats_le, cmp_le, <=);
+
+pub fn simd_filter_stats_between(data: &[f64], lo: f64, hi: f64) -> Option<(usize, f64, f64, f64)> {
+    let lo_v = f64x4::splat(lo);
+    let hi_v = f64x4::splat(hi);
+    let mut sum_v = f64x4::ZERO;
+    let mut min_v = f64x4::splat(f64::INFINITY);
+    let mut max_v = f64x4::splat(f64::NEG_INFINITY);
+    let mut count = 0usize;
+    let (left, right) = data.split_at(data.len() / 4 * 4);
+
+    for chunk in left.chunks_exact(4) {
+        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
+        let mask_bits = mask.move_mask();
+        if mask_bits != 0 {
+            count += mask_bits.count_ones() as usize;
+            sum_v += mask.blend(v, f64x4::ZERO);
+            min_v = min_v.min(mask.blend(v, f64x4::splat(f64::INFINITY)));
+            max_v = max_v.max(mask.blend(v, f64x4::splat(f64::NEG_INFINITY)));
+        }
+    }
+
+    let sum_arr: [f64; 4] = sum_v.into();
+    let min_arr: [f64; 4] = min_v.into();
+    let max_arr: [f64; 4] = max_v.into();
+    let mut sum = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    let mut min = min_arr[0].min(min_arr[1]).min(min_arr[2]).min(min_arr[3]);
+    let mut max = max_arr[0].max(max_arr[1]).max(max_arr[2]).max(max_arr[3]);
+
+    for &x in right {
+        if x >= lo && x <= hi {
+            count += 1;
+            sum += x;
+            min = min.min(x);
+            max = max.max(x);
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some((count, sum, min, max))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // i64 SIMD filter — returns a new Vec<i64>
 //
 // Uses i64x4 for the comparison (4 lanes in parallel).
@@ -1428,4 +1552,197 @@ pub fn simd_filter_i64_le(data: &[i64], threshold: i64) -> Vec<i64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn float_eq(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-10)
+    }
+
+    fn range_f64(n: usize) -> Vec<f64> {
+        (0..n).map(|i| i as f64).collect()
+    }
+
+    // ── filter_gt ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_gt_basic() {
+        let data = vec![1.0, 5.0, 3.0, 7.0, 2.0];
+        let result = simd_filter_gt(&data, 3.0);
+        assert_eq!(result, vec![5.0, 7.0]);
+    }
+
+    #[test]
+    fn test_filter_gt_empty() {
+        assert_eq!(simd_filter_gt(&[], 0.0), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_filter_gt_all_pass() {
+        let data = vec![5.0, 6.0, 7.0];
+        assert_eq!(simd_filter_gt(&data, 4.0), data);
+    }
+
+    #[test]
+    fn test_filter_gt_none_pass() {
+        let data = vec![1.0, 2.0, 3.0];
+        assert_eq!(simd_filter_gt(&data, 10.0), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_filter_gt_simd_width_boundary() {
+        // 9 elements: exercises both 4-wide SIMD chunks and scalar tail
+        let data = range_f64(9);
+        let result = simd_filter_gt(&data, 4.0);
+        let expected: Vec<f64> = vec![5.0, 6.0, 7.0, 8.0];
+        assert!(float_eq(&result, &expected));
+    }
+
+    // ── filter_ge ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_ge_boundary() {
+        let data = vec![3.0, 4.0, 5.0];
+        assert_eq!(simd_filter_ge(&data, 4.0), vec![4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_filter_ge_empty() {
+        assert_eq!(simd_filter_ge(&[], 0.0), Vec::<f64>::new());
+    }
+
+    // ── filter_lt / filter_le ────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_lt_basic() {
+        let data = vec![1.0, 5.0, 3.0, 7.0, 2.0];
+        let result = simd_filter_lt(&data, 4.0);
+        assert_eq!(result, vec![1.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn test_filter_le_boundary() {
+        let data = vec![2.0, 3.0, 4.0, 5.0];
+        assert_eq!(simd_filter_le(&data, 3.0), vec![2.0, 3.0]);
+    }
+
+    // ── filter_between ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_between_basic() {
+        let data = vec![1.0, 3.0, 5.0, 7.0, 9.0];
+        let result = simd_filter_between(&data, 3.0, 7.0);
+        assert_eq!(result, vec![3.0, 5.0, 7.0]);
+    }
+
+    #[test]
+    fn test_filter_between_empty_input() {
+        assert_eq!(simd_filter_between(&[], 0.0, 10.0), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_filter_between_none_pass() {
+        let data = vec![1.0, 2.0];
+        assert_eq!(simd_filter_between(&data, 5.0, 10.0), Vec::<f64>::new());
+    }
+
+    // ── map_mul_inplace ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_mul_basic() {
+        let mut data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        simd_map_mul_inplace(&mut data, 2.0);
+        assert!(float_eq(&data, &[2.0, 4.0, 6.0, 8.0, 10.0]));
+    }
+
+    #[test]
+    fn test_map_mul_empty() {
+        let mut data: Vec<f64> = vec![];
+        simd_map_mul_inplace(&mut data, 3.0);
+        assert_eq!(data, Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_map_mul_simd_boundary() {
+        // 9 elements: 2 SIMD chunks (4+4) + 1 scalar
+        let mut data = vec![1.0; 9];
+        simd_map_mul_inplace(&mut data, 3.0);
+        assert!(float_eq(&data, &vec![3.0; 9]));
+    }
+
+    // ── map_add / map_sub / map_neg ──────────────────────────────────────────
+
+    #[test]
+    fn test_map_add_basic() {
+        let mut data = vec![1.0, 2.0, 3.0];
+        simd_map_add_inplace(&mut data, 10.0);
+        assert!(float_eq(&data, &[11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn test_map_sub_basic() {
+        let mut data = vec![5.0, 6.0, 7.0];
+        simd_map_sub_inplace(&mut data, 3.0);
+        assert!(float_eq(&data, &[2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn test_map_neg_basic() {
+        let mut data = vec![1.0, -2.0, 3.0];
+        simd_map_neg_inplace(&mut data);
+        assert!(float_eq(&data, &[-1.0, 2.0, -3.0]));
+    }
+
+    #[test]
+    fn test_map_neg_empty() {
+        let mut data: Vec<f64> = vec![];
+        simd_map_neg_inplace(&mut data);
+        assert_eq!(data, Vec::<f64>::new());
+    }
+
+    // ── NaN handling ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_gt_nan_excluded() {
+        // NaN comparisons always return false, so NaN is excluded; valid floats pass normally
+        let data = vec![1.0, f64::NAN, 5.0];
+        let result = simd_filter_gt(&data, 0.0);
+        // 1.0 > 0.0 = true, NaN > 0.0 = false (excluded), 5.0 > 0.0 = true
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], 1.0);
+        assert_eq!(result[1], 5.0);
+    }
+
+    // ── consistency: large data uses SIMD path ────────────────────────────────
+
+    #[test]
+    fn test_filter_gt_large_matches_scalar() {
+        // Compare SIMD result against a simple scalar reference
+        let data: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let simd_result = simd_filter_gt(&data, 500.0);
+        let scalar_result: Vec<f64> = data.iter().copied().filter(|&x| x > 500.0).collect();
+        assert_eq!(simd_result, scalar_result);
+    }
+
+    #[test]
+    fn test_filter_between_large_matches_scalar() {
+        let data: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let simd_result = simd_filter_between(&data, 200.0, 800.0);
+        let scalar_result: Vec<f64> = data.iter().copied().filter(|&x| x >= 200.0 && x <= 800.0).collect();
+        assert_eq!(simd_result, scalar_result);
+    }
+
+    #[test]
+    fn test_map_mul_large_matches_scalar() {
+        let mut simd_data: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let mut scalar_data = simd_data.clone();
+        simd_map_mul_inplace(&mut simd_data, 1.5);
+        for x in &mut scalar_data { *x *= 1.5; }
+        assert!(float_eq(&simd_data, &scalar_data));
+    }
 }

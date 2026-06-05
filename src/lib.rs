@@ -9,11 +9,9 @@
 //!
 //! All other types (`ZStream`, `NumericPipeline`, etc.) are Rust-internal.
 
+pub mod core;
 pub mod io;
-pub mod parallel;
-pub mod pipeline;
 pub mod python;
-pub mod simd;
 
 use pyo3::prelude::*;
 use python::{field, PyAggSpec, PyColProxy, PyExpr, PyFieldExpr, PyQuery};

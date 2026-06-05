@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use std::io::{BufRead, Cursor};
 use std::sync::Arc;
 
-use crate::pipeline::obj::{RustRow, RustValue};
+use crate::core::{RustRow, RustValue};
 
 use super::{AutoMode, ParsedOutput};
 
@@ -83,5 +83,96 @@ fn json_to_rust(v: serde_json::Value) -> RustValue {
         }
         serde_json::Value::String(s) => RustValue::Str(Arc::from(s.as_str())),
         _ => RustValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::RustValue;
+
+    fn jsonl(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    // ── parse_jsonl_rows ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rows_basic() {
+        let rows = parse_jsonl_rows(jsonl("{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["a"], RustValue::Int(1));
+        assert_eq!(rows[1]["a"], RustValue::Int(3));
+    }
+
+    #[test]
+    fn test_parse_rows_float_field() {
+        let rows = parse_jsonl_rows(jsonl("{\"x\":1.5}")).unwrap();
+        match &rows[0]["x"] {
+            RustValue::Float(f) => assert!((f - 1.5).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_rows_skips_blank_lines() {
+        let rows = parse_jsonl_rows(jsonl("{\"a\":1}\n\n{\"a\":2}")).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_rows_empty_input() {
+        let rows = parse_jsonl_rows(jsonl("")).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_rows_invalid_json_errors() {
+        let result = parse_jsonl_rows(jsonl("not json"));
+        assert!(result.is_err());
+    }
+
+    // ── parse_jsonl_field ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_field_float() {
+        let result = parse_jsonl_field(
+            jsonl("{\"score\":0.9}\n{\"score\":0.5}"),
+            "score".to_string(),
+            "float",
+        )
+        .unwrap();
+        match result {
+            ParsedOutput::F64(v) => {
+                assert!((v[0] - 0.9).abs() < 1e-10);
+                assert!((v[1] - 0.5).abs() < 1e-10);
+            }
+            _ => panic!("expected F64"),
+        }
+    }
+
+    #[test]
+    fn test_parse_field_int() {
+        let result = parse_jsonl_field(
+            jsonl("{\"n\":10}\n{\"n\":20}"),
+            "n".to_string(),
+            "int",
+        )
+        .unwrap();
+        match result {
+            ParsedOutput::I64(v) => assert_eq!(v, vec![10, 20]),
+            _ => panic!("expected I64"),
+        }
+    }
+
+    #[test]
+    fn test_parse_field_missing_key_treated_as_null() {
+        // missing field → RustValue::Null → parsed as Str (auto-mode fallback)
+        let result = parse_jsonl_field(
+            jsonl("{\"other\":1}"),
+            "score".to_string(),
+            "auto",
+        );
+        assert!(result.is_ok());
     }
 }

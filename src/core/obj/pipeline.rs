@@ -55,6 +55,11 @@ pub enum ObjOp {
     FilterFieldEq(Arc<str>, RustValue),
     FilterFieldNe(Arc<str>, RustValue),
     FilterFieldBetween(Arc<str>, f64, f64),
+    StrStartsWith(Arc<str>, Arc<str>),
+    StrEndsWith(Arc<str>, Arc<str>),
+    StrContains(Arc<str>, Arc<str>),
+    /// Compiled regex stored behind Arc for cheap Clone across pipeline branches.
+    StrMatches(Arc<str>, Arc<regex::Regex>),
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +125,17 @@ pub fn row_passes(row: &RustRow, op: &ObjOp) -> bool {
         ObjOp::FilterFieldEq(f, target) => row.get(f.as_ref()).map_or(false, |v| v == target),
         ObjOp::FilterFieldNe(f, target) => row.get(f.as_ref()).map_or(false, |v| v != target),
         ObjOp::FilterFieldBetween(f, lo, hi) => cmp_num(row, f, |v| v >= *lo && v <= *hi),
+        ObjOp::StrStartsWith(f, prefix) => match_str(row, f, |s| s.starts_with(prefix.as_ref())),
+        ObjOp::StrEndsWith(f, suffix) => match_str(row, f, |s| s.ends_with(suffix.as_ref())),
+        ObjOp::StrContains(f, sub) => match_str(row, f, |s| s.contains(sub.as_ref())),
+        ObjOp::StrMatches(f, re) => match_str(row, f, |s| re.is_match(s)),
+    }
+}
+
+fn match_str(row: &RustRow, field: &str, pred: impl Fn(&str) -> bool) -> bool {
+    match row.get(field) {
+        Some(RustValue::Str(s)) => pred(s),
+        _ => false,
     }
 }
 

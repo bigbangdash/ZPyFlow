@@ -2,7 +2,7 @@ use ahash::AHashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::pipeline::obj::{RustRow, RustValue};
+use crate::core::{RustRow, RustValue};
 
 use super::{AutoMode, ColSpec, ParsedOutput};
 
@@ -131,4 +131,101 @@ fn csv_auto(s: &str) -> RustValue {
         return RustValue::Bool(false);
     }
     RustValue::Str(Arc::from(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::RustValue;
+
+    fn csv(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    // ── parse_csv_rows ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rows_basic() {
+        let rows = parse_csv_rows(csv("a,b\n1,2\n3,4"), b',', true).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["a"], RustValue::Int(1));
+        assert_eq!(rows[0]["b"], RustValue::Int(2));
+        assert_eq!(rows[1]["a"], RustValue::Int(3));
+    }
+
+    #[test]
+    fn test_parse_rows_no_header() {
+        let rows = parse_csv_rows(csv("1,2\n3,4"), b',', false).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["0"], RustValue::Int(1));
+        assert_eq!(rows[0]["1"], RustValue::Int(2));
+    }
+
+    #[test]
+    fn test_parse_rows_custom_delimiter() {
+        let rows = parse_csv_rows(csv("a;b\n1;2"), b';', true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["a"], RustValue::Int(1));
+    }
+
+    #[test]
+    fn test_parse_rows_float_values() {
+        let rows = parse_csv_rows(csv("x\n1.5\n2.7"), b',', true).unwrap();
+        match &rows[0]["x"] {
+            RustValue::Float(f) => assert!((f - 1.5).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_rows_empty_input() {
+        let rows = parse_csv_rows(csv("a,b\n"), b',', true).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    // ── parse_csv_column ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_column_by_name_float() {
+        let result = parse_csv_column(
+            csv("x,y\n1.0,2.0\n3.0,4.0"),
+            ColSpec::Name("x".to_string()),
+            "float",
+            b',',
+            true,
+        )
+        .unwrap();
+        match result {
+            ParsedOutput::F64(v) => assert_eq!(v, vec![1.0, 3.0]),
+            _ => panic!("expected F64"),
+        }
+    }
+
+    #[test]
+    fn test_parse_column_by_index() {
+        let result = parse_csv_column(
+            csv("a,b\n10,20\n30,40"),
+            ColSpec::Index(1),
+            "int",
+            b',',
+            true,
+        )
+        .unwrap();
+        match result {
+            ParsedOutput::I64(v) => assert_eq!(v, vec![20, 40]),
+            _ => panic!("expected I64"),
+        }
+    }
+
+    #[test]
+    fn test_parse_column_unknown_name_errors() {
+        let result = parse_csv_column(
+            csv("x,y\n1,2"),
+            ColSpec::Name("z".to_string()),
+            "auto",
+            b',',
+            true,
+        );
+        assert!(result.is_err());
+    }
 }

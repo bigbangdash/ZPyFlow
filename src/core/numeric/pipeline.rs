@@ -15,7 +15,7 @@
 //!   execute()        ≈  terminal `Sum()` / `ToArray()` triggering TryGetNext loop
 //!   Arc<Vec<f64>>    ≈  `ReadOnlySpan<T>` borrow (TryGetSpan → SIMD path)
 
-use crate::simd;
+use super::simd;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,10 @@ pub enum NumericOp {
     FilterEq(f64),
     FilterNe(f64),
     FilterBetween(f64, f64), // inclusive
-    FilterNotNan,            // x == x: passes when NOT NaN (arrow null-drop pattern)
+    FilterNotNan,
+    FilterNan,
+    FilterFinite,
+    FilterInf,            // x == x: passes when NOT NaN (arrow null-drop pattern)
 
     // Scalar maps
     MapMulScalar(f64),
@@ -42,6 +45,8 @@ pub enum NumericOp {
     MapSubScalar(f64),
     MapDivScalar(f64),
     MapPowScalar(f64),
+    MapMod(f64),
+    MapFloorDiv(f64),
 
     // Unary maps
     MapAbs,
@@ -51,10 +56,70 @@ pub enum NumericOp {
     MapCeil,
     MapRound,
     MapReciprocal,
+    MapLog,
+    MapLog2,
+    MapLog10,
+    MapExp,
+    MapSigmoid,
+
+    // Binary maps
+    MapClamp(f64, f64),
 
     // Control flow
     Take(usize),
     Skip(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FilterKind {
+    Gt(f64),
+    Ge(f64),
+    Lt(f64),
+    Le(f64),
+    Between(f64, f64),
+}
+
+fn single_filter_kind(ops: &[NumericOp]) -> Option<FilterKind> {
+    if ops.len() != 1 {
+        return None;
+    }
+    match ops[0] {
+        NumericOp::FilterGt(t) => Some(FilterKind::Gt(t)),
+        NumericOp::FilterGe(t) => Some(FilterKind::Ge(t)),
+        NumericOp::FilterLt(t) => Some(FilterKind::Lt(t)),
+        NumericOp::FilterLe(t) => Some(FilterKind::Le(t)),
+        NumericOp::FilterBetween(lo, hi) => Some(FilterKind::Between(lo, hi)),
+        _ => None,
+    }
+}
+
+fn is_filter_only_f64(ops: &[NumericOp]) -> bool {
+    ops.iter().all(|op| {
+        matches!(
+            op,
+            NumericOp::FilterGt(_)
+                | NumericOp::FilterGe(_)
+                | NumericOp::FilterLt(_)
+                | NumericOp::FilterLe(_)
+                | NumericOp::FilterEq(_)
+                | NumericOp::FilterNe(_)
+                | NumericOp::FilterBetween(_, _)
+                | NumericOp::FilterNotNan
+                | NumericOp::FilterNan
+                | NumericOp::FilterFinite
+                | NumericOp::FilterInf
+        )
+    })
+}
+
+fn filter_stats_simd_f64(data: &[f64], kind: FilterKind) -> Option<(usize, f64, f64, f64)> {
+    match kind {
+        FilterKind::Gt(t) => simd::simd_filter_stats_gt(data, t),
+        FilterKind::Ge(t) => simd::simd_filter_stats_ge(data, t),
+        FilterKind::Lt(t) => simd::simd_filter_stats_lt(data, t),
+        FilterKind::Le(t) => simd::simd_filter_stats_le(data, t),
+        FilterKind::Between(lo, hi) => simd::simd_filter_stats_between(data, lo, hi),
+    }
 }
 
 /// A fused sequence of numeric operations over a f64 array.
@@ -460,6 +525,10 @@ pub fn filter_multi_stat_f64(
     data: &[f64],
     ops: &[NumericOp],
 ) -> Option<(usize, f64, f64, f64)> {
+    if let Some(kind) = single_filter_kind(ops) {
+        return filter_stats_simd_f64(data, kind);
+    }
+
     let mut count = 0usize;
     let mut sum = 0.0f64;
     let mut min = f64::INFINITY;
@@ -484,6 +553,171 @@ pub fn filter_multi_stat_f64(
     } else {
         Some((count, sum, min, max))
     }
+}
+
+/// Fused bounded stats over the final pipeline values.
+///
+/// Unlike `filter_multi_stat_f64`, this applies both filters and maps, and it
+/// honors output-level skip/take. It never materializes the filtered output.
+pub fn stats_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> Option<(usize, f64, f64, f64)> {
+    if out_skip == 0 && out_take.is_none() && is_filter_only_f64(ops) {
+        return filter_multi_stat_f64(data, ops);
+    }
+
+    let mut count = 0usize;
+    let mut skipped = 0usize;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    'outer: for &raw in data {
+        let mut val = raw;
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < out_skip {
+            skipped += 1;
+            continue;
+        }
+        count += 1;
+        sum += val;
+        if val < min {
+            min = val;
+        }
+        if val > max {
+            max = val;
+        }
+        if out_take.is_some_and(|n| count >= n) {
+            break;
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some((count, sum, min, max))
+    }
+}
+
+/// Fused bounded sum over the final pipeline values. Never allocates.
+pub fn sum_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> f64 {
+    if out_skip == 0 && out_take.is_none() {
+        if let Some(s) = filter_sum_fused_f64(data, ops) {
+            return s;
+        }
+        if ops.is_empty() {
+            return simd::simd_sum_f64(data);
+        }
+    }
+    stats_fused_f64_bounded(data, ops, out_skip, out_take)
+        .map(|(_, sum, _, _)| sum)
+        .unwrap_or(0.0)
+}
+
+/// Fused bounded mean over the final pipeline values. Never allocates.
+pub fn mean_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> Option<f64> {
+    if out_skip == 0 && out_take.is_none() {
+        if let Some(mean) = filter_mean_fused_f64(data, ops) {
+            return mean;
+        }
+    }
+    stats_fused_f64_bounded(data, ops, out_skip, out_take)
+        .map(|(count, sum, _, _)| sum / count as f64)
+}
+
+/// Fused bounded population variance over the final pipeline values.
+///
+/// Uses two direct scans to match the existing mean-then-ssq behavior without
+/// materializing an intermediate Vec.
+pub fn var_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> Option<f64> {
+    if out_skip == 0 && out_take.is_none() {
+        if let Some(var) = filter_var_fused_f64(data, ops) {
+            return var;
+        }
+    }
+    let (count, sum, _, _) = stats_fused_f64_bounded(data, ops, out_skip, out_take)?;
+    let mean = sum / count as f64;
+    let mut seen = 0usize;
+    let mut skipped = 0usize;
+    let mut ssq = 0.0f64;
+
+    'outer: for &raw in data {
+        let mut val = raw;
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < out_skip {
+            skipped += 1;
+            continue;
+        }
+        let d = val - mean;
+        ssq += d * d;
+        seen += 1;
+        if out_take.is_some_and(|n| seen >= n) {
+            break;
+        }
+    }
+
+    Some(ssq / count as f64)
+}
+
+/// Fused bounded minimum over the final pipeline values. Never allocates.
+pub fn min_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> Option<f64> {
+    if out_skip == 0 && out_take.is_none() {
+        if let Some(min) = filter_min_fused_f64(data, ops) {
+            return min;
+        }
+    }
+    stats_fused_f64_bounded(data, ops, out_skip, out_take).map(|(_, _, min, _)| min)
+}
+
+/// Fused bounded maximum over the final pipeline values. Never allocates.
+pub fn max_fused_f64_bounded(
+    data: &[f64],
+    ops: &[NumericOp],
+    out_skip: usize,
+    out_take: Option<usize>,
+) -> Option<f64> {
+    if out_skip == 0 && out_take.is_none() {
+        if let Some(max) = filter_max_fused_f64(data, ops) {
+            return max;
+        }
+        if ops.is_empty() {
+            return simd::simd_max_f64(data);
+        }
+    }
+    stats_fused_f64_bounded(data, ops, out_skip, out_take).map(|(_, _, _, max)| max)
 }
 
 /// Count variant for the i64 fast path.
@@ -589,11 +823,16 @@ pub(crate) fn apply_scalar_op(val: f64, op: &NumericOp) -> ScalarResult {
             }
         }
         NumericOp::FilterNotNan => {
-            if !val.is_nan() {
-                ScalarResult::Value(val)
-            } else {
-                ScalarResult::Filtered
-            }
+            if !val.is_nan() { ScalarResult::Value(val) } else { ScalarResult::Filtered }
+        }
+        NumericOp::FilterNan => {
+            if val.is_nan() { ScalarResult::Value(val) } else { ScalarResult::Filtered }
+        }
+        NumericOp::FilterFinite => {
+            if val.is_finite() { ScalarResult::Value(val) } else { ScalarResult::Filtered }
+        }
+        NumericOp::FilterInf => {
+            if val.is_infinite() { ScalarResult::Value(val) } else { ScalarResult::Filtered }
         }
 
         NumericOp::MapMulScalar(s) => ScalarResult::Value(val * s),
@@ -601,6 +840,8 @@ pub(crate) fn apply_scalar_op(val: f64, op: &NumericOp) -> ScalarResult {
         NumericOp::MapSubScalar(s) => ScalarResult::Value(val - s),
         NumericOp::MapDivScalar(s) => ScalarResult::Value(val / s),
         NumericOp::MapPowScalar(s) => ScalarResult::Value(val.powf(*s)),
+        NumericOp::MapMod(s) => ScalarResult::Value(val % s),
+        NumericOp::MapFloorDiv(s) => ScalarResult::Value((val / s).floor()),
         NumericOp::MapAbs => ScalarResult::Value(val.abs()),
         NumericOp::MapNeg => ScalarResult::Value(-val),
         NumericOp::MapSqrt => ScalarResult::Value(val.sqrt()),
@@ -608,6 +849,12 @@ pub(crate) fn apply_scalar_op(val: f64, op: &NumericOp) -> ScalarResult {
         NumericOp::MapCeil => ScalarResult::Value(val.ceil()),
         NumericOp::MapRound => ScalarResult::Value(val.round()),
         NumericOp::MapReciprocal => ScalarResult::Value(1.0 / val),
+        NumericOp::MapLog => ScalarResult::Value(val.ln()),
+        NumericOp::MapLog2 => ScalarResult::Value(val.log2()),
+        NumericOp::MapLog10 => ScalarResult::Value(val.log10()),
+        NumericOp::MapExp => ScalarResult::Value(val.exp()),
+        NumericOp::MapSigmoid => ScalarResult::Value(1.0 / (1.0 + (-val).exp())),
+        NumericOp::MapClamp(lo, hi) => ScalarResult::Value(val.clamp(*lo, *hi)),
 
         // Skip/Take are bounds, not value transforms — pass the value through.
         // Bounds are enforced by the loop in execute_fused_f64_bounded, not here.
@@ -639,8 +886,16 @@ fn can_use_simd_path(ops: &[NumericOp]) -> bool {
         | NumericOp::MapCeil
         | NumericOp::MapRound
         | NumericOp::MapReciprocal
-        | NumericOp::Skip(_)   // neutral — bounds handled before loop
-        | NumericOp::Take(_) // neutral — bounds handled before loop
+        | NumericOp::MapLog
+        | NumericOp::MapLog2
+        | NumericOp::MapLog10
+        | NumericOp::MapExp
+        | NumericOp::MapSigmoid
+        | NumericOp::MapClamp(_, _)
+        | NumericOp::MapMod(_)
+        | NumericOp::MapFloorDiv(_)
+        | NumericOp::Skip(_)
+        | NumericOp::Take(_)
         )
     })
 }
@@ -657,6 +912,9 @@ fn has_filter_f64(ops: &[NumericOp]) -> bool {
                 | NumericOp::FilterNe(_)
                 | NumericOp::FilterBetween(_, _)
                 | NumericOp::FilterNotNan
+                | NumericOp::FilterNan
+                | NumericOp::FilterFinite
+                | NumericOp::FilterInf
         )
     })
 }
@@ -704,6 +962,15 @@ pub(crate) fn apply_scalar_op_f32(val: f32, op: &NumericOp) -> ScalarResult32 {
         NumericOp::FilterNotNan => {
             if !val.is_nan() { ScalarResult32::Value(val) } else { ScalarResult32::Filtered }
         }
+        NumericOp::FilterNan => {
+            if val.is_nan() { ScalarResult32::Value(val) } else { ScalarResult32::Filtered }
+        }
+        NumericOp::FilterFinite => {
+            if val.is_finite() { ScalarResult32::Value(val) } else { ScalarResult32::Filtered }
+        }
+        NumericOp::FilterInf => {
+            if val.is_infinite() { ScalarResult32::Value(val) } else { ScalarResult32::Filtered }
+        }
         NumericOp::MapMulScalar(s) => ScalarResult32::Value(val * *s as f32),
         NumericOp::MapAddScalar(s) => ScalarResult32::Value(val + *s as f32),
         NumericOp::MapSubScalar(s) => ScalarResult32::Value(val - *s as f32),
@@ -716,6 +983,14 @@ pub(crate) fn apply_scalar_op_f32(val: f32, op: &NumericOp) -> ScalarResult32 {
         NumericOp::MapCeil => ScalarResult32::Value(val.ceil()),
         NumericOp::MapRound => ScalarResult32::Value(val.round()),
         NumericOp::MapReciprocal => ScalarResult32::Value(1.0 / val),
+        NumericOp::MapLog => ScalarResult32::Value(val.ln()),
+        NumericOp::MapLog2 => ScalarResult32::Value(val.log2()),
+        NumericOp::MapLog10 => ScalarResult32::Value(val.log10()),
+        NumericOp::MapExp => ScalarResult32::Value(val.exp()),
+        NumericOp::MapSigmoid => ScalarResult32::Value(1.0 / (1.0 + (-val).exp())),
+        NumericOp::MapClamp(lo, hi) => ScalarResult32::Value(val.clamp(*lo as f32, *hi as f32)),
+        NumericOp::MapMod(s) => ScalarResult32::Value(val % *s as f32),
+        NumericOp::MapFloorDiv(s) => ScalarResult32::Value((val / *s as f32).floor()),
         NumericOp::Take(_) | NumericOp::Skip(_) => ScalarResult32::Value(val),
     }
 }
@@ -1269,6 +1544,102 @@ mod tests {
         assert_eq!(result, vec![1.0, 2.0, 3.0]);
     }
 
+    #[test]
+    fn f64_filter_stats_gt_uses_predicate_semantics() {
+        let data = vec![f64::NAN, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let result = filter_multi_stat_f64(&data, &[NumericOp::FilterGt(0.0)]).unwrap();
+        assert_eq!(result.0, 3);
+        assert_eq!(result.1, 6.0);
+        assert_eq!(result.2, 1.0);
+        assert_eq!(result.3, 3.0);
+    }
+
+    #[test]
+    fn f64_filter_stats_order_predicates_match_execute() {
+        let data = vec![f64::NAN, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let cases = vec![
+            NumericOp::FilterGt(0.0),
+            NumericOp::FilterGe(0.0),
+            NumericOp::FilterLt(1.0),
+            NumericOp::FilterLe(1.0),
+            NumericOp::FilterBetween(-1.0, 2.0),
+        ];
+
+        for op in cases {
+            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            let expected = if values.is_empty() {
+                None
+            } else {
+                Some((
+                    values.len(),
+                    values.iter().sum::<f64>(),
+                    values.iter().copied().reduce(f64::min).unwrap(),
+                    values.iter().copied().reduce(f64::max).unwrap(),
+                ))
+            };
+            assert_eq!(filter_multi_stat_f64(&data, &[op]), expected);
+        }
+    }
+
+    #[test]
+    fn f64_filter_stats_between_is_inclusive() {
+        let data = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let result = filter_multi_stat_f64(&data, &[NumericOp::FilterBetween(1.0, 3.0)]).unwrap();
+        assert_eq!(result, (3, 6.0, 1.0, 3.0));
+    }
+
+    #[test]
+    fn f64_bounded_stats_falls_back_for_skip_take() {
+        let data = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let result = stats_fused_f64_bounded(&data, &[NumericOp::FilterGe(1.0)], 1, Some(2)).unwrap();
+        assert_eq!(result, (2, 5.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn f64_count_single_filter_predicates_match_execute() {
+        let data = vec![f64::NAN, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let cases = vec![
+            NumericOp::FilterGt(0.0),
+            NumericOp::FilterGe(0.0),
+            NumericOp::FilterLt(1.0),
+            NumericOp::FilterLe(1.0),
+            NumericOp::FilterBetween(-1.0, 2.0),
+        ];
+
+        for op in cases {
+            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            assert_eq!(
+                count_fused_f64_bounded(&data, &[op], 0, None),
+                values.len()
+            );
+        }
+    }
+
+    #[test]
+    fn f64_sum_mean_single_filter_predicates_match_execute() {
+        let data = vec![f64::NAN, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let cases = vec![
+            NumericOp::FilterGt(0.0),
+            NumericOp::FilterGe(0.0),
+            NumericOp::FilterLt(1.0),
+            NumericOp::FilterLe(1.0),
+            NumericOp::FilterBetween(-1.0, 2.0),
+        ];
+
+        for op in cases {
+            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            let expected_sum = values.iter().sum::<f64>();
+            let expected_mean = if values.is_empty() {
+                None
+            } else {
+                Some(expected_sum / values.len() as f64)
+            };
+
+            assert_eq!(filter_sum_fused_f64(&data, &[op.clone()]), Some(expected_sum));
+            assert_eq!(filter_mean_fused_f64(&data, &[op]), Some(expected_mean));
+        }
+    }
+
     // --- f64 chained ops ---
 
     #[test]
@@ -1338,5 +1709,65 @@ mod tests {
     fn eval_filter_i64_ne() {
         assert!(eval_filter_i64(5, &IntOp::FilterNe(3)));
         assert!(!eval_filter_i64(3, &IntOp::FilterNe(3)));
+    }
+
+    // ── parallel execution ────────────────────────────────────────────────────
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_f64_filter_matches_sequential() {
+        let data: Vec<f64> = (0..10_000).map(|i| i as f64).collect();
+        let ops = vec![NumericOp::FilterGt(5000.0)];
+
+        let sequential = NumericPipeline::new(data.clone()).with_ops(ops.clone()).execute();
+        let parallel = NumericPipeline::new(data).with_ops(ops).execute_parallel();
+
+        assert_eq!(sequential.len(), parallel.len());
+        // Order may differ after rayon; compare sorted results
+        let mut seq_sorted = sequential;
+        let mut par_sorted = parallel;
+        seq_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        par_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(seq_sorted, par_sorted);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_f64_map_matches_sequential() {
+        let data: Vec<f64> = (0..1_000).map(|i| i as f64).collect();
+        let ops = vec![NumericOp::MapMulScalar(2.0)];
+
+        let sequential = NumericPipeline::new(data.clone()).with_ops(ops.clone()).execute();
+        let mut parallel = NumericPipeline::new(data).with_ops(ops).execute_parallel();
+
+        // rayon map-only path preserves relative order within chunks but not globally;
+        // sort both for a stable comparison
+        let mut seq_sorted = sequential;
+        seq_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        parallel.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(seq_sorted, parallel);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_i64_filter_matches_sequential() {
+        let data: Vec<i64> = (0..10_000).collect();
+        let ops = vec![IntOp::FilterGt(5000)];
+
+        let sequential = IntPipeline::new(data.clone()).with_ops(ops.clone()).execute();
+        let parallel = IntPipeline::new(data).with_ops(ops).execute_parallel();
+
+        let mut seq_sorted = sequential;
+        let mut par_sorted = parallel;
+        seq_sorted.sort();
+        par_sorted.sort();
+        assert_eq!(seq_sorted, par_sorted);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_empty_input() {
+        let parallel = NumericPipeline::new(vec![]).with_ops(vec![NumericOp::FilterGt(0.0)]).execute_parallel();
+        assert!(parallel.is_empty());
     }
 }

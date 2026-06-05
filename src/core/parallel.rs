@@ -15,7 +15,7 @@
 
 #[cfg(feature = "parallel")]
 pub mod engine {
-    use crate::pipeline::numeric::{apply_int_op, apply_scalar_op, IntOp, NumericOp, ScalarResult};
+    use crate::core::numeric::pipeline::{apply_int_op, apply_scalar_op, IntOp, NumericOp, ScalarResult};
     use rayon::prelude::*;
 
     /// Bench utility: filter/map a f64 vec in parallel.
@@ -56,9 +56,9 @@ pub mod engine {
 // Stub when parallel feature disabled
 #[cfg(not(feature = "parallel"))]
 pub mod engine {
-    use crate::pipeline::numeric::NumericOp;
+    use crate::core::numeric::pipeline::NumericOp;
 
     pub fn par_execute_f64(data: Vec<f64>, _ops: &[NumericOp]) -> Vec<f64> {
-        crate::pipeline::numeric::NumericPipeline::new(data).execute()
+        crate::core::numeric::pipeline::NumericPipeline::new(data).execute()
     }
 }
