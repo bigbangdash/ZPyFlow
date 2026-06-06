@@ -17,9 +17,10 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 simd    = []       # Requires nightly (portable_simd); stable uses wide
 arrow   = []  # reserved feature flag — arrow2 removed (RUSTSEC-2025-0038, no fix available)
+extension-module = ["pyo3/extension-module"]  # enabled by maturin via pyproject.toml; absent for cargo test
 
 [dependencies]
-pyo3        = { version = "0.21", features = ["extension-module", "abi3-py310", "multiple-pymethods"] }
+pyo3        = { version = "0.21", features = ["abi3-py310", "multiple-pymethods"] }
 rayon       = { version = "1.9", optional = true }
 wide        = "0.7"     # Stable portable SIMD - f64x4, f32x8, i64x4, etc.
 num-traits  = "0.2"
