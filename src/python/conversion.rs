@@ -10,7 +10,7 @@ use ahash::AHashMap;
 use std::sync::Arc;
 
 use super::expr::py_to_rust_value;
-use crate::pipeline::obj::{RustRow, RustValue};
+use crate::core::{RustRow, RustValue};
 
 /// Python dict → RustRow. GIL must be held.
 pub(super) fn py_dict_to_rust_row(dict: &Bound<'_, PyDict>) -> PyResult<RustRow> {

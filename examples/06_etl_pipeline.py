@@ -9,6 +9,8 @@ Demonstrates:
   - Enriching records with lookups
   - Writing to a target (in-memory dict as stand-in for a DB)
   - Measuring throughput
+  - Field-level mutations with set_field, add_field, drop_field
+  - Frequency analysis with value_counts
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import random
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-from zpyflow import Query, col, from_csv, from_json_lines
+from zpyflow import Query, col, from_csv, from_json_lines, field
 
 random.seed(99)
 
@@ -183,3 +185,42 @@ total_ms      = etl_ms + event_etl_ms + numeric_etl_ms
 print(f"\nCase 4 — Total throughput:")
 print(f"  {total_records:,} records in {total_ms:.1f}ms → "
       f"{total_records / total_ms * 1000:,.0f} records/sec")
+
+# ------------------------------------------------------------------
+# Case 5: Field mutations — set_field, add_field, drop_field
+# ------------------------------------------------------------------
+
+# Use the already-cleaned products list from Case 1
+print("\nCase 5 — Field mutations (set_field / add_field / drop_field):")
+
+enriched = (
+    Query(products_clean)
+        # Apply 10% discount to budget tier
+        .set_field("price_usd", lambda p: round(p * 0.90, 2)
+                   if True else p)          # simplified: discount all for demo
+        # Derive a display label
+        .add_field("label", lambda p: f"{p['name']} ({p['price_tier']}) ${p['price_usd']:.2f}")
+        # Remove internal fields not needed downstream
+        .drop_field("price_eur", "in_stock")
+        .take(3)
+        .to_list()
+)
+
+print("  Sample enriched records (first 3):")
+for r in enriched:
+    print(f"    {r['label']}")
+
+# ------------------------------------------------------------------
+# Case 6: value_counts — category and price-tier distributions
+# ------------------------------------------------------------------
+print("\nCase 6 — value_counts: category and price-tier frequency:")
+
+category_counts = Query(products_clean).value_counts(lambda p: p["category"])
+print("  Category distribution:")
+for cat, n in sorted(category_counts.items(), key=lambda x: -x[1]):
+    print(f"    {cat:12s}  {n:,}")
+
+tier_counts = Query(products_clean).value_counts(lambda p: p["price_tier"])
+print("  Price tier distribution:")
+for tier, n in sorted(tier_counts.items(), key=lambda x: -x[1]):
+    print(f"    {tier:8s}  {n:,}")

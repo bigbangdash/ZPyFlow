@@ -55,6 +55,11 @@ pub enum ObjOp {
     FilterFieldEq(Arc<str>, RustValue),
     FilterFieldNe(Arc<str>, RustValue),
     FilterFieldBetween(Arc<str>, f64, f64),
+    StrStartsWith(Arc<str>, Arc<str>),
+    StrEndsWith(Arc<str>, Arc<str>),
+    StrContains(Arc<str>, Arc<str>),
+    /// Compiled regex stored behind Arc for cheap Clone across pipeline branches.
+    StrMatches(Arc<str>, Arc<regex::Regex>),
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +75,7 @@ pub fn execute_obj_pipeline(
 ) -> Vec<RustRow> {
     let cap = take.unwrap_or(data.len()).min(data.len());
     let mut out = Vec::with_capacity(cap);
-    for_each_matching_row(data, ops, skip, take, |row| {
+    apply_to_matching_rows(data, ops, skip, take, |row| {
         out.push(Arc::clone(row));
     });
     out
@@ -84,7 +89,7 @@ pub fn count_obj_pipeline(
     take: Option<usize>,
 ) -> usize {
     let mut count = 0usize;
-    for_each_matching_row(data, ops, skip, take, |_| {
+    apply_to_matching_rows(data, ops, skip, take, |_| {
         count += 1;
     });
     count
@@ -99,7 +104,7 @@ pub fn sum_field_obj_pipeline(
     take: Option<usize>,
 ) -> f64 {
     let mut acc = 0.0f64;
-    for_each_matching_row(data, ops, skip, take, |row| {
+    apply_to_matching_rows(data, ops, skip, take, |row| {
         if let Some(v) = row.get(field) {
             acc += v.as_f64();
         }
@@ -113,17 +118,28 @@ pub fn sum_field_obj_pipeline(
 
 pub fn row_passes(row: &RustRow, op: &ObjOp) -> bool {
     match op {
-        ObjOp::FilterFieldGt(f, t) => cmp_num(row, f, |v| v > *t),
-        ObjOp::FilterFieldGe(f, t) => cmp_num(row, f, |v| v >= *t),
-        ObjOp::FilterFieldLt(f, t) => cmp_num(row, f, |v| v < *t),
-        ObjOp::FilterFieldLe(f, t) => cmp_num(row, f, |v| v <= *t),
+        ObjOp::FilterFieldGt(f, t) => row_field_passes_numeric_cmp(row, f, |v| v > *t),
+        ObjOp::FilterFieldGe(f, t) => row_field_passes_numeric_cmp(row, f, |v| v >= *t),
+        ObjOp::FilterFieldLt(f, t) => row_field_passes_numeric_cmp(row, f, |v| v < *t),
+        ObjOp::FilterFieldLe(f, t) => row_field_passes_numeric_cmp(row, f, |v| v <= *t),
         ObjOp::FilterFieldEq(f, target) => row.get(f.as_ref()).map_or(false, |v| v == target),
         ObjOp::FilterFieldNe(f, target) => row.get(f.as_ref()).map_or(false, |v| v != target),
-        ObjOp::FilterFieldBetween(f, lo, hi) => cmp_num(row, f, |v| v >= *lo && v <= *hi),
+        ObjOp::FilterFieldBetween(f, lo, hi) => row_field_passes_numeric_cmp(row, f, |v| v >= *lo && v <= *hi),
+        ObjOp::StrStartsWith(f, prefix) => match_str(row, f, |s| s.starts_with(prefix.as_ref())),
+        ObjOp::StrEndsWith(f, suffix) => match_str(row, f, |s| s.ends_with(suffix.as_ref())),
+        ObjOp::StrContains(f, sub) => match_str(row, f, |s| s.contains(sub.as_ref())),
+        ObjOp::StrMatches(f, re) => match_str(row, f, |s| re.is_match(s)),
     }
 }
 
-fn for_each_matching_row(
+fn match_str(row: &RustRow, field: &str, pred: impl Fn(&str) -> bool) -> bool {
+    match row.get(field) {
+        Some(RustValue::Str(s)) => pred(s),
+        _ => false,
+    }
+}
+
+fn apply_to_matching_rows(
     data: &[RustRow],
     ops: &[ObjOp],
     skip: usize,
@@ -151,7 +167,7 @@ fn for_each_matching_row(
     }
 }
 
-fn cmp_num(row: &RustRow, field: &str, cmp: impl Fn(f64) -> bool) -> bool {
+fn row_field_passes_numeric_cmp(row: &RustRow, field: &str, cmp: impl Fn(f64) -> bool) -> bool {
     row.get(field).map_or(false, |v| cmp(v.as_f64()))
 }
 
@@ -308,7 +324,7 @@ mod tests {
     #[test]
     fn row_passes_missing_field() {
         let r = row(&[("score", f(5.0))]);
-        // Field "age" doesn't exist → cmp_num returns false → row does NOT pass
+        // Field "age" doesn't exist → row_field_passes_numeric_cmp returns false → row does NOT pass
         assert!(!row_passes(
             &r,
             &ObjOp::FilterFieldGt(Arc::from("age"), 0.0)

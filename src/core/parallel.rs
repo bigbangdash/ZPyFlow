@@ -3,24 +3,24 @@
 //! ## Responsibility split
 //!
 //! **Production path** (query.rs → Python API):
-//!   `NumericPipeline::execute_parallel_bounded` in `pipeline/numeric.rs`.
+//!   `NumericPipeline::execute_parallel_with_skip_take` in `pipeline/numeric.rs`.
 //!   Activated via `.parallel()` on a `PyQuery`.  Takes ownership of the
 //!   pipeline, extracts skip/take bounds, then fans out via Rayon.
 //!
 //! **Bench path** (benches/pipeline.rs):
-//!   `engine::par_execute_f64` / `par_execute_i64` below.
+//!   `engine::parallel_execute_f64_pipeline` / `parallel_execute_i64_pipeline` below.
 //!   Simpler entry points that take raw `Vec<T>` + ops — useful for
 //!   microbenchmarks that want to drive the parallel kernel without going
 //!   through the full Python wrapper stack.
 
 #[cfg(feature = "parallel")]
 pub mod engine {
-    use crate::pipeline::numeric::{apply_int_op, apply_scalar_op, IntOp, NumericOp, ScalarResult};
+    use crate::core::numeric::pipeline::{apply_int_op, apply_scalar_op, IntOp, NumericOp, ScalarResult};
     use rayon::prelude::*;
 
     /// Bench utility: filter/map a f64 vec in parallel.
-    /// Production code uses `NumericPipeline::execute_parallel_bounded` instead.
-    pub fn par_execute_f64(data: Vec<f64>, ops: &[NumericOp]) -> Vec<f64> {
+    /// Production code uses `NumericPipeline::execute_parallel_with_skip_take` instead.
+    pub fn parallel_execute_f64_pipeline(data: Vec<f64>, ops: &[NumericOp]) -> Vec<f64> {
         let ops_arc = std::sync::Arc::new(ops.to_vec());
         data.into_par_iter()
             .filter_map(move |mut val| {
@@ -36,8 +36,8 @@ pub mod engine {
     }
 
     /// Bench utility: filter/map an i64 vec in parallel.
-    /// Production code uses `IntPipeline::execute_parallel_bounded` instead.
-    pub fn par_execute_i64(data: Vec<i64>, ops: &[IntOp]) -> Vec<i64> {
+    /// Production code uses `IntPipeline::execute_parallel_with_skip_take` instead.
+    pub fn parallel_execute_i64_pipeline(data: Vec<i64>, ops: &[IntOp]) -> Vec<i64> {
         let ops_arc = std::sync::Arc::new(ops.to_vec());
         data.into_par_iter()
             .filter_map(move |mut val| {
@@ -56,9 +56,9 @@ pub mod engine {
 // Stub when parallel feature disabled
 #[cfg(not(feature = "parallel"))]
 pub mod engine {
-    use crate::pipeline::numeric::NumericOp;
+    use crate::core::numeric::pipeline::NumericOp;
 
-    pub fn par_execute_f64(data: Vec<f64>, _ops: &[NumericOp]) -> Vec<f64> {
-        crate::pipeline::numeric::NumericPipeline::new(data).execute()
+    pub fn parallel_execute_f64_pipeline(data: Vec<f64>, _ops: &[NumericOp]) -> Vec<f64> {
+        crate::core::numeric::pipeline::NumericPipeline::new(data).execute()
     }
 }

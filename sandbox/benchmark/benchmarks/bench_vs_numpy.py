@@ -107,10 +107,10 @@ class TestMapVsNumpy:
         result = benchmark(lambda: from_numpy(arr).map(col * 2.0).to_list())
         assert len(result) == N
 
-    def test_zpyflow_dsl_to_numpy(self, benchmark, lst):
-        """to_numpy() output: Vec→ndarray zero-copy transfer."""
+    def test_zpyflow_dsl_to_ndarray(self, benchmark, lst):
+        """to_bytes() → frombuffer: raw-byte transfer to ndarray."""
         benchmark.group = "map (multiply) N=1M → ndarray"
-        result = benchmark(lambda: Query(lst).map(col * 2.0).to_numpy())
+        result = benchmark(lambda: np.frombuffer(Query(lst).map(col * 2.0).to_bytes()).copy())
         assert len(result) == N
 
     def test_numpy_multiply_ndarray(self, benchmark, arr):
@@ -233,12 +233,12 @@ class TestSumVsNumpy:
 
 
 # ---------------------------------------------------------------------------
-# to_numpy() vs to_list() — output path comparison
-# Shows the benefit of direct Vec→ndarray transfer over per-element boxing.
+# to_bytes()+frombuffer vs to_list() — output path comparison
+# Shows the benefit of raw-byte transfer over per-element float boxing.
 # ---------------------------------------------------------------------------
 
-class TestToNumpyVsToList:
-    """filter → output: compare to_numpy() vs to_list() + np.array()."""
+class TestToNdarrayVsToList:
+    """filter → output: compare to_bytes()+frombuffer vs to_list() + np.array()."""
 
     def test_numpy_boolean_index(self, benchmark, arr):
         """Baseline: numpy boolean indexing returns an ndarray directly."""
@@ -252,14 +252,14 @@ class TestToNumpyVsToList:
         result = benchmark(lambda: np.array(Query(lst).filter(col > 0).to_list()))
         assert len(result) > 0
 
-    def test_zpyflow_to_numpy(self, benchmark, lst):
-        """to_numpy(): one allocation, zero per-element boxing."""
+    def test_zpyflow_to_bytes_frombuffer(self, benchmark, lst):
+        """to_bytes() → frombuffer: raw-byte transfer, no per-element boxing."""
         benchmark.group = "filter→ndarray N=1M"
-        result = benchmark(lambda: Query(lst).filter(col > 0).to_numpy())
+        result = benchmark(lambda: np.frombuffer(Query(lst).filter(col > 0).to_bytes()).copy())
         assert len(result) > 0
 
-    def test_zpyflow_from_numpy_to_numpy(self, benchmark, arr):
-        """from_numpy → SIMD filter → to_numpy: full zero-copy round-trip."""
+    def test_zpyflow_from_numpy_to_bytes(self, benchmark, arr):
+        """from_numpy → SIMD filter → to_bytes() → frombuffer: full raw-byte round-trip."""
         benchmark.group = "filter→ndarray N=1M"
-        result = benchmark(lambda: from_numpy(arr).filter(col > 0).to_numpy())
+        result = benchmark(lambda: np.frombuffer(from_numpy(arr).filter(col > 0).to_bytes()).copy())
         assert len(result) > 0

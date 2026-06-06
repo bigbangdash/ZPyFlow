@@ -8,6 +8,7 @@ Shows:
   - Comparing single-thread vs parallel on different data sizes
   - Memory-efficient chaining vs naive Python
   - Profiling patterns
+  - Materialise-once patterns with cache() and tee()
 """
 
 from __future__ import annotations
@@ -165,3 +166,35 @@ print(f"  {'operation':45s} {'time':>8s}")
 print(f"  {'-'*53}")
 for label, fn in ops:
     timed(label, fn, warmup=True)
+
+# ------------------------------------------------------------------
+# Case 7: Materialise-once with cache() and tee()
+# ------------------------------------------------------------------
+print("\nCase 7 — Materialise-once: cache() vs tee()")
+
+data_small = rng.standard_normal(50_000).tolist()
+
+# Without cache: the filter runs three times
+t0 = time.perf_counter()
+q = Query(data_small).filter(col > 0).map(col * 2)
+r1 = q.count()
+r2 = q.sum()
+r3 = q.mean()
+ms_no_cache = (time.perf_counter() - t0) * 1000
+print(f"  Without cache (3 passes):  {ms_no_cache:.2f}ms  count={r1}")
+
+# With cache: filter+map runs once, results reused
+t0 = time.perf_counter()
+cached = Query(data_small).filter(col > 0).map(col * 2).cache()
+c1 = cached.count()
+c2 = cached.sum()
+c3 = cached.mean()
+ms_cache = (time.perf_counter() - t0) * 1000
+print(f"  With cache    (1 pass):    {ms_cache:.2f}ms  count={c1}  ({ms_no_cache/ms_cache:.1f}x faster)")
+
+# tee: fork into independent copies before the pipeline diverges
+q_pos, q_neg = Query(data_small).tee()
+pos_count = q_pos.filter(col > 0).count()
+neg_count = q_neg.filter(col < 0).count()
+print(f"\n  tee() — split into 2 independent queries from the same source:")
+print(f"    positives: {pos_count:,}   negatives: {neg_count:,}   total: {pos_count+neg_count:,}")

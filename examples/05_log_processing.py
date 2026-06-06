@@ -8,6 +8,7 @@ Simulates:
   - Extracting numeric fields for fast aggregation
   - Summarizing error patterns
   - Latency percentile approximation
+  - Joining logs with a user lookup table (inner_join / left_join)
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import random
 import time
 from collections import Counter, defaultdict
 
-from zpyflow import Query, col, GroupBy
+from zpyflow import Query, col, GroupBy, field
 
 random.seed(7)
 
@@ -137,3 +138,53 @@ for start in range(len(logs) - WINDOW * 5, len(logs), WINDOW):
     window = logs[start : start + WINDOW]
     error_rate = Query(window).filter(lambda l: l["status"] >= 500).count() / WINDOW * 100
     print(f"  records [{start:,}–{start+WINDOW:,}]  error_rate={error_rate:.1f}%")
+
+# ------------------------------------------------------------------
+# Case 8: Join logs with a user lookup table
+# ------------------------------------------------------------------
+
+# Simulate a user registry (user_id → tier)
+USER_TIERS = {uid: random.choice(["free", "pro", "enterprise"])
+              for uid in range(1, 10_001)}
+users = [{"user_id": uid, "tier": tier} for uid, tier in USER_TIERS.items()]
+
+# inner_join: only logs that have a matching user_id (drops user_id=None)
+auth_logs = [l for l in logs if l["user_id"] is not None]
+
+enriched = (
+    Query(auth_logs)
+        .inner_join(users, left_key="user_id", right_key="user_id")
+        .map(lambda pair: {
+            "path":  pair[0]["path"],
+            "status": pair[0]["status"],
+            "tier":  pair[1]["tier"],
+        })
+        .to_list()
+)
+
+tier_errors: dict[str, int] = {}
+tier_total:  dict[str, int] = {}
+for r in enriched:
+    tier_errors[r["tier"]] = tier_errors.get(r["tier"], 0) + (1 if r["status"] >= 500 else 0)
+    tier_total[r["tier"]]  = tier_total.get(r["tier"], 0) + 1
+
+print(f"\nCase 8 — Error rate by user tier (inner_join logs × users):")
+print(f"  Matched {len(enriched):,} of {len(auth_logs):,} authenticated logs")
+for tier in ("free", "pro", "enterprise"):
+    n   = tier_total.get(tier, 0)
+    err = tier_errors.get(tier, 0)
+    print(f"  {tier:12s}  n={n:,}  errors={err:,}  rate={err/n*100:.1f}%")
+
+# left_join: keep ALL logs, including those with user_id=None (unauthenticated)
+all_enriched = (
+    Query(logs)
+        .left_join(users, left_key="user_id", right_key="user_id")
+        .map(lambda pair: {
+            "status": pair[0]["status"],
+            "tier":   pair[1]["tier"] if pair[1] else "anonymous",
+        })
+        .to_list()
+)
+
+anon_count = Query(all_enriched).filter(lambda r: r["tier"] == "anonymous").count()
+print(f"\n  left_join: {len(all_enriched):,} total logs, {anon_count:,} anonymous (no user_id)")

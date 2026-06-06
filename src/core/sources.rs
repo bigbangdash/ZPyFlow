@@ -4,7 +4,7 @@
 //! The slice sources hold a *reference*, so they are lifetime-bound; the owned
 //! variants hold a `Vec` and drive the Rust ownership model cleanly.
 
-use crate::pipeline::traits::ZStream;
+use super::traits::ZStream;
 
 // ---------------------------------------------------------------------------
 // Slice source — borrows data, zero allocation, best for hot loops

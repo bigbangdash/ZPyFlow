@@ -9,14 +9,12 @@
 //!
 //! All other types (`ZStream`, `NumericPipeline`, etc.) are Rust-internal.
 
+pub mod core;
 pub mod io;
-pub mod parallel;
-pub mod pipeline;
 pub mod python;
-pub mod simd;
 
 use pyo3::prelude::*;
-use python::{field, PyAggSpec, PyColProxy, PyExpr, PyFieldExpr, PyQuery};
+use python::{_convert_to_columnar, _hash_join_by_field, _infer_schema, field, PyAggSpec, PyColProxy, PyExpr, PyFieldExpr, PyQuery};
 
 #[pymodule]
 fn _zpyflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -26,6 +24,9 @@ fn _zpyflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAggSpec>()?;
     m.add_class::<PyFieldExpr>()?;
     m.add_function(wrap_pyfunction!(field, m)?)?;
+    m.add_function(wrap_pyfunction!(_infer_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(_convert_to_columnar, m)?)?;
+    m.add_function(wrap_pyfunction!(_hash_join_by_field, m)?)?;
 
     m.add("col", PyColProxy {})?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

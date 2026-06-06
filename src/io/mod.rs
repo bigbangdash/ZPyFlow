@@ -9,7 +9,7 @@ pub mod jsonl;
 pub use csv::{parse_csv_column, parse_csv_rows};
 pub use jsonl::{parse_jsonl_field, parse_jsonl_rows};
 
-use crate::pipeline::obj::RustRow;
+use crate::core::RustRow;
 
 // ---------------------------------------------------------------------------
 // Parsed output — maps to a QueryInner variant after GIL is re-acquired

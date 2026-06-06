@@ -3,11 +3,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
-use crate::pipeline::numeric::{
-    count_fused_f32_bounded, count_fused_f64_bounded, eval_filter_f64, execute_fused_f32_bounded,
-    execute_fused_f64_bounded, NumericOp,
+use crate::core::{
+    count_fused_f32_with_skip_take, count_fused_f64_with_skip_take, eval_filter_f64, execute_fused_f32_with_skip_take,
+    execute_fused_f64_with_skip_take, filter_mean_fused_f64, filter_multi_stat_f64, filter_sum_fused_f64,
+    ObjOp, RustValue, NumericOp,
 };
-use crate::pipeline::obj::{ObjOp, RustValue};
+use crate::core::numeric::pipeline::{apply_scalar_op, ScalarResult};
+
 
 // ---------------------------------------------------------------------------
 // abi3-compatible buffer protocol — wraps PyObject_GetBuffer / PyBuffer_Release.
@@ -104,28 +106,38 @@ impl Drop for RawBuffer {
 // so ob_fval never changes after allocation.
 // ---------------------------------------------------------------------------
 
-/// Read ob_fval via the stable C API — no hardcoded byte offset.
-/// PyFloat_AsDouble returns -1.0 on type mismatch (with exception set);
-/// since Query::new() validates that all elements are float, this never fires.
+/// Extract f64 from a Python object, returning NaN for non-float elements.
 ///
-/// # Safety
-/// - GIL must be held.
-/// - `ptr` must be a live, non-null `PyFloat` object (refcount > 0).
+/// Calls `PyFloat_AsDouble`; for non-float objects (e.g. None) it returns -1.0
+/// and sets a TypeError. We call `PyErr_Clear()` both before (defensive) and
+/// after detecting the error, ensuring the interpreter exception state is clean
+/// regardless of platform or Python version.
+///
+/// Non-float → NaN is consistent with the Arrow null path (spec-027).
+/// SIMD filter ops (col > x) naturally exclude NaN (IEEE 754).
 #[inline]
-unsafe fn pyfloat_ob_fval(ptr: *mut pyo3::ffi::PyObject) -> f64 {
-    pyo3::ffi::PyFloat_AsDouble(ptr)
+unsafe fn pyfloat_as_f64(ptr: *mut pyo3::ffi::PyObject) -> f64 {
+    pyo3::ffi::PyErr_Clear();
+    let val = pyo3::ffi::PyFloat_AsDouble(ptr);
+    if val == -1.0 && !pyo3::ffi::PyErr_Occurred().is_null() {
+        pyo3::ffi::PyErr_Clear();
+        f64::NAN
+    } else {
+        val
+    }
 }
 
 const CHUNK_SIZE: usize = 4096; // 32 KB — fits in typical L1 cache
 
-/// Materialize a Python list[float] into a fresh Vec<f64> using direct ob_fval reads.
+/// Materialize a Python list[float | None] into a fresh Vec<f64>.
+/// Non-float elements (e.g. None) become NaN.
 fn materialize_lazy_float_list(list_ptr: *mut pyo3::ffi::PyObject) -> Vec<f64> {
     unsafe {
         let n = pyo3::ffi::PyList_Size(list_ptr) as usize;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let elem = pyo3::ffi::PyList_GetItem(list_ptr, i as isize);
-            out.push(pyfloat_ob_fval(elem));
+            out.push(pyfloat_as_f64(elem));
         }
         out
     }
@@ -146,7 +158,7 @@ pub(super) fn count_lazy_float_list(
 ) -> usize {
     if skip > 0 || take.is_some() {
         let v = materialize_lazy_float_list(list_ptr);
-        return count_fused_f64_bounded(&v, ops, skip, take);
+        return count_fused_f64_with_skip_take(&v, ops, skip, take);
     }
     let n = unsafe { pyo3::ffi::PyList_Size(list_ptr) as usize };
     let mut total = 0usize;
@@ -158,14 +170,140 @@ pub(super) fn count_lazy_float_list(
         unsafe {
             for j in 0..chunk_size {
                 let elem = pyo3::ffi::PyList_GetItem(list_ptr, (i + j) as isize);
-                chunk_buf[j] = pyfloat_ob_fval(elem);
+                chunk_buf[j] = pyfloat_as_f64(elem);
             }
         }
-        total += count_fused_f64_bounded(&chunk_buf[..chunk_size], ops, 0, None);
+        total += count_fused_f64_with_skip_take(&chunk_buf[..chunk_size], ops, 0, None);
         i = end;
     }
     total
 }
+
+pub(super) fn stats_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<(usize, f64, f64, f64)> {
+    let n = unsafe { pyo3::ffi::PyList_Size(list_ptr) as usize };
+    let mut skipped = 0usize;
+    let mut count = 0usize;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    'outer: for i in 0..n {
+        let mut val = unsafe {
+            let elem = pyo3::ffi::PyList_GetItem(list_ptr, i as isize);
+            pyfloat_as_f64(elem)
+        };
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        count += 1;
+        sum += val;
+        if val < min {
+            min = val;
+        }
+        if val > max {
+            max = val;
+        }
+        if take.is_some_and(|n| count >= n) {
+            break;
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some((count, sum, min, max))
+    }
+}
+
+pub(super) fn sum_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> f64 {
+    stats_lazy_float_list(list_ptr, ops, skip, take)
+        .map(|(_, sum, _, _)| sum)
+        .unwrap_or(0.0)
+}
+
+pub(super) fn mean_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<f64> {
+    stats_lazy_float_list(list_ptr, ops, skip, take).map(|(count, sum, _, _)| sum / count as f64)
+}
+
+pub(super) fn var_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<f64> {
+    let (count, sum, _, _) = stats_lazy_float_list(list_ptr, ops, skip, take)?;
+    let mean = sum / count as f64;
+    let n = unsafe { pyo3::ffi::PyList_Size(list_ptr) as usize };
+    let mut skipped = 0usize;
+    let mut seen = 0usize;
+    let mut ssq = 0.0f64;
+
+    'outer: for i in 0..n {
+        let mut val = unsafe {
+            let elem = pyo3::ffi::PyList_GetItem(list_ptr, i as isize);
+            pyfloat_as_f64(elem)
+        };
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        let d = val - mean;
+        ssq += d * d;
+        seen += 1;
+        if take.is_some_and(|n| seen >= n) {
+            break;
+        }
+    }
+
+    Some(ssq / count as f64)
+}
+
+pub(super) fn min_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<f64> {
+    stats_lazy_float_list(list_ptr, ops, skip, take).map(|(_, _, min, _)| min)
+}
+
+pub(super) fn max_lazy_float_list(
+    list_ptr: *mut pyo3::ffi::PyObject,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<f64> {
+    stats_lazy_float_list(list_ptr, ops, skip, take).map(|(_, _, _, max)| max)
+}
+
 
 /// Execute a LazyFloatList pipeline.
 ///
@@ -189,7 +327,7 @@ pub(super) fn execute_lazy_float_list(
 
     if !use_chunked {
         let v = materialize_lazy_float_list(list_ptr);
-        return execute_fused_f64_bounded(&v, ops, skip, take);
+        return execute_fused_f64_with_skip_take(&v, ops, skip, take);
     }
 
     let mut out = Vec::with_capacity(take_n);
@@ -204,12 +342,12 @@ pub(super) fn execute_lazy_float_list(
         unsafe {
             for j in 0..chunk_size {
                 let elem = pyo3::ffi::PyList_GetItem(list_ptr, (i + j) as isize);
-                chunk_buf[j] = pyfloat_ob_fval(elem);
+                chunk_buf[j] = pyfloat_as_f64(elem);
             }
         }
 
         let chunk_slice = &chunk_buf[..chunk_size];
-        let filtered = py.allow_threads(|| execute_fused_f64_bounded(chunk_slice, ops, 0, None));
+        let filtered = py.allow_threads(|| execute_fused_f64_with_skip_take(chunk_slice, ops, 0, None));
 
         for val in filtered {
             if skipped < skip {
@@ -494,7 +632,7 @@ pub(super) fn count_by_field(
     // Safety: `values` lives in the enclosing frame, valid for the whole allow_threads call.
     Ok(py.allow_threads(move || {
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
-        count_fused_f64_bounded(slice, &ops_c, skip, take)
+        count_fused_f64_with_skip_take(slice, &ops_c, skip, take)
     }))
 }
 
@@ -512,7 +650,7 @@ struct PreparedFieldOp {
     is_eq: bool,
 }
 
-fn prepare_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<PreparedFieldOp>> {
+fn precompile_obj_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<PreparedFieldOp>> {
     ops.iter()
         .filter_map(|op| {
             let (fname, rv, is_eq) = match op {
@@ -559,7 +697,7 @@ pub(super) fn filter_by_field_py(
     let list_ptr = list.as_ptr();
     let n = list.len();
 
-    let prepared = prepare_field_ops(py, ops)?;
+    let prepared = precompile_obj_field_ops(py, ops)?;
     let map_key: Option<PyObject> =
         map_field.map(|s| pyo3::types::PyString::new_bound(py, s).unbind().into());
 
@@ -644,7 +782,7 @@ pub(super) fn count_by_field_py(
     let list_ptr = list.as_ptr();
     let n = list.len();
 
-    let prepared = prepare_field_ops(py, ops)?;
+    let prepared = precompile_obj_field_ops(py, ops)?;
 
     let mut count = 0usize;
     let mut skipped = 0usize;
@@ -704,7 +842,7 @@ pub(super) fn execute_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        execute_fused_f64_bounded(slice, ops, skip, take)
+        execute_fused_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -721,7 +859,238 @@ pub(super) fn count_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        count_fused_f64_bounded(slice, ops, skip, take)
+        count_fused_f64_with_skip_take(slice, ops, skip, take)
+    });
+    Ok(result)
+}
+
+#[inline]
+fn compute_stats_f64_with_skip_take(
+    data: &[f64],
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<(usize, f64, f64, f64)> {
+    if skip == 0
+        && take.is_none()
+        && ops.iter().all(|op| {
+            matches!(
+                op,
+                NumericOp::FilterGt(_)
+                    | NumericOp::FilterGe(_)
+                    | NumericOp::FilterLt(_)
+                    | NumericOp::FilterLe(_)
+                    | NumericOp::FilterEq(_)
+                    | NumericOp::FilterNe(_)
+                    | NumericOp::FilterBetween(_, _)
+                    | NumericOp::FilterNotNan
+            )
+        })
+    {
+        return filter_multi_stat_f64(data, ops);
+    }
+
+    let mut count = 0usize;
+    let mut skipped = 0usize;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    'outer: for &raw in data {
+        let mut val = raw;
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        count += 1;
+        sum += val;
+        if val < min {
+            min = val;
+        }
+        if val > max {
+            max = val;
+        }
+        if take.is_some_and(|n| count >= n) {
+            break;
+        }
+    }
+
+    if count == 0 {
+        None
+    } else {
+        Some((count, sum, min, max))
+    }
+}
+
+#[inline]
+fn compute_variance_f64_with_skip_take(
+    data: &[f64],
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> Option<f64> {
+    let (count, sum, _, _) = compute_stats_f64_with_skip_take(data, ops, skip, take)?;
+    let mean = sum / count as f64;
+    let mut seen = 0usize;
+    let mut skipped = 0usize;
+    let mut ssq = 0.0f64;
+
+    'outer: for &raw in data {
+        let mut val = raw;
+        for op in ops {
+            match apply_scalar_op(val, op) {
+                ScalarResult::Value(v) => val = v,
+                ScalarResult::Filtered => continue 'outer,
+            }
+        }
+        if skipped < skip {
+            skipped += 1;
+            continue;
+        }
+        let d = val - mean;
+        ssq += d * d;
+        seen += 1;
+        if take.is_some_and(|n| seen >= n) {
+            break;
+        }
+    }
+
+    Some(ssq / count as f64)
+}
+
+pub(super) fn sum_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<f64> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        if skip == 0 && take.is_none() {
+            if let Some(s) = filter_sum_fused_f64(slice, ops) {
+                return s;
+            }
+        }
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
+            .map(|(_, sum, _, _)| sum)
+            .unwrap_or(0.0)
+    });
+    Ok(result)
+}
+
+pub(super) fn mean_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<Option<f64>> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        if skip == 0 && take.is_none() {
+            if let Some(mean) = filter_mean_fused_f64(slice, ops) {
+                return mean;
+            }
+        }
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
+            .map(|(count, sum, _, _)| sum / count as f64)
+    });
+    Ok(result)
+}
+
+pub(super) fn var_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<Option<f64>> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        compute_variance_f64_with_skip_take(slice, ops, skip, take)
+    });
+    Ok(result)
+}
+
+pub(super) fn min_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<Option<f64>> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, min, _)| min)
+    });
+    Ok(result)
+}
+
+pub(super) fn max_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<Option<f64>> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, _, max)| max)
+    });
+    Ok(result)
+}
+
+pub(super) fn stats_numpy_f64(
+    py: Python<'_>,
+    source: &Py<PyAny>,
+    ops: &[NumericOp],
+    skip: usize,
+    take: Option<usize>,
+) -> PyResult<Option<(usize, f64, f64, f64)>> {
+    let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
+    let n = buf.item_count();
+    let ptr = buf.buf_ptr::<f64>() as usize;
+    let result = py.allow_threads(|| unsafe {
+        let slice = std::slice::from_raw_parts(ptr as *const f64, n);
+        if skip == 0 && take.is_none() {
+            // Fast path for pure filter chains; falls through for maps.
+            if ops.iter().all(|op| matches!(
+                op,
+                NumericOp::FilterGt(_)
+                    | NumericOp::FilterGe(_)
+                    | NumericOp::FilterLt(_)
+                    | NumericOp::FilterLe(_)
+                    | NumericOp::FilterEq(_)
+                    | NumericOp::FilterNe(_)
+                    | NumericOp::FilterBetween(_, _)
+                    | NumericOp::FilterNotNan
+            )) {
+                return filter_multi_stat_f64(slice, ops);
+            }
+        }
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -739,7 +1108,7 @@ pub(super) fn execute_numpy_f32(
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
-        execute_fused_f32_bounded(slice, ops, skip, take)
+        execute_fused_f32_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -757,7 +1126,153 @@ pub(super) fn count_numpy_f32(
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
-        count_fused_f32_bounded(slice, ops, skip, take)
+        count_fused_f32_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::prelude::*;
+    use pyo3::types::PyList;
+
+    // ── materialize_lazy_float_list ───────────────────────────────────────────
+
+    #[test]
+    fn test_materialize_normal() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let list = PyList::new_bound(py, [1.0f64, 2.0, 3.0]);
+            let result = materialize_lazy_float_list(list.as_ptr());
+            assert_eq!(result, vec![1.0, 2.0, 3.0]);
+        });
+    }
+
+    #[test]
+    fn test_materialize_empty() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let list = PyList::empty_bound(py);
+            let result = materialize_lazy_float_list(list.as_ptr());
+            assert!(result.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_materialize_integers_coerced() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            // Python list of ints → floats via PyLong_AsDouble
+            let list = PyList::new_bound(py, [1i64, 2, 3]);
+            let result = materialize_lazy_float_list(list.as_ptr());
+            assert_eq!(result, vec![1.0, 2.0, 3.0]);
+        });
+    }
+
+    // ── count_lazy_float_list ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_count_matches_execute() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let data: Vec<f64> = (0..100).map(|i| i as f64).collect();
+            let list = PyList::new_bound(py, &data);
+            let ops = vec![NumericOp::FilterGt(50.0)];
+
+            let count = count_lazy_float_list(list.as_ptr(), &ops, 0, None);
+            let materialized = materialize_lazy_float_list(list.as_ptr());
+            let expected: Vec<f64> = materialized.into_iter().filter(|&x| x > 50.0).collect();
+
+            assert_eq!(count, expected.len());
+        });
+    }
+
+    #[test]
+    fn test_count_with_skip_take() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let data: Vec<f64> = (0..20).map(|i| i as f64).collect();
+            let list = PyList::new_bound(py, &data);
+            let ops = vec![NumericOp::FilterGt(5.0)];
+
+            // count_lazy_float_list with skip/take falls back to count_fused_f64_with_skip_take,
+            // which applies filter first, then skip/take on the filtered results.
+            // Verify count equals execute path (materialize → filter → skip → take).
+            let count = count_lazy_float_list(list.as_ptr(), &ops, 2, Some(5));
+            let executed = execute_lazy_float_list(py, list.as_ptr(), &ops, 2, Some(5));
+            assert_eq!(count, executed.len());
+        });
+    }
+
+    #[test]
+    fn test_count_empty_list() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let list = PyList::empty_bound(py);
+            let count = count_lazy_float_list(list.as_ptr(), &[], 0, None);
+            assert_eq!(count, 0);
+        });
+    }
+
+    // ── extract_f64_from_dict_item ────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_f64_from_float_value() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use pyo3::types::{PyDict, PyString};
+            let dict = PyDict::new_bound(py);
+            dict.set_item("score", 3.14f64).unwrap();
+            let key = PyString::new_bound(py, "score");
+            let result = unsafe {
+                extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
+            };
+            assert!((result - 3.14).abs() < 1e-10);
+        });
+    }
+
+    #[test]
+    fn test_extract_f64_from_int_value() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use pyo3::types::{PyDict, PyString};
+            let dict = PyDict::new_bound(py);
+            dict.set_item("count", 42i64).unwrap();
+            let key = PyString::new_bound(py, "count");
+            let result = unsafe {
+                extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
+            };
+            assert_eq!(result, 42.0);
+        });
+    }
+
+    #[test]
+    fn test_extract_f64_missing_key_returns_nan() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            use pyo3::types::{PyDict, PyString};
+            let dict = PyDict::new_bound(py);
+            let key = PyString::new_bound(py, "missing");
+            let result = unsafe {
+                extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
+            };
+            assert!(result.is_nan());
+        });
+    }
+
+    #[test]
+    fn test_extract_f64_null_ptr_returns_nan() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            use pyo3::types::PyString;
+            Python::with_gil(|py| {
+                let key = PyString::new_bound(py, "k");
+                let result = unsafe {
+                    extract_f64_from_dict_item(std::ptr::null_mut(), key.as_ptr())
+                };
+                assert!(result.is_nan());
+            });
+        });
+    }
 }

@@ -81,11 +81,11 @@ numpy_ms = (time.perf_counter() - t0) * 1000
 
 t0 = time.perf_counter()
 _ = from_numpy(big).filter(col > 0).map(col * 2).to_list()
-zpf_ms = (time.perf_counter() - t0) * 1000
+zpyflow_ms = (time.perf_counter() - t0) * 1000
 
 print(f"Case 5 — 5M elements:")
 print(f"  numpy:   {numpy_ms:.1f}ms  (2 intermediate arrays)")
-print(f"  zpyflow: {zpf_ms:.1f}ms  (1 allocation, GIL released)")
+print(f"  zpyflow: {zpyflow_ms:.1f}ms  (1 allocation, GIL released)")
 
 # ------------------------------------------------------------------
 # Case 6: Convert result back to numpy
