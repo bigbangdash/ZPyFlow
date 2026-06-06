@@ -1,8 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # PR gate: rust-test, cargo-deny, pytest-quick
+  pull_request:
     paths-ignore:
       - "docs/**"
       - "site/**"
@@ -11,7 +11,9 @@ on:
       - "**.md"
       - "mkdocs.yml"
       - "LICENSE"
-  pull_request:
+  # Post-merge: miri, pytest-full (heavy jobs only)
+  push:
+    branches: [main]
     paths-ignore:
       - "docs/**"
       - "site/**"
@@ -39,10 +41,11 @@ permissions:
   contents: read
 
 jobs:
-  # ── Rust unit tests (always) ───────────────────────────────────────────────
+  # ── Rust unit tests — PR gate ─────────────────────────────────────────────
   rust-test:
     name: Rust tests
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,10 +59,11 @@ jobs:
           echo "LIBRARY_PATH=$LIBDIR${LIBRARY_PATH:+:$LIBRARY_PATH}" >> $GITHUB_ENV
       - run: cargo test --lib
 
-  # ── Dependency audit (always) ──────────────────────────────────────────────
+  # ── Dependency audit — PR gate ────────────────────────────────────────────
   cargo-deny:
     name: cargo-deny audit
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,13 +91,13 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
 
-  # ── Python tests: PR / push — Linux py3.11 のみ（速い）─────────────────────
+  # ── Python tests — PR gate (Linux py3.11 only, fast) ─────────────────────
   pytest-quick:
     name: pytest (ubuntu / py3.11)
     runs-on: ubuntu-latest
     if: |
-      github.event_name != 'workflow_dispatch' ||
-      inputs.run_quick == true
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_quick == true)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
