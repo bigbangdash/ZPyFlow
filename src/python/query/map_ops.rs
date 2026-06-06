@@ -5,7 +5,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::python::agg::{AggSpecKind, GroupKey, PyAggSpec};
+use crate::python::columnar::{
+    apply_columnar_ops, columnar_indices_to_py_list, convert_to_columnar, ColumnarData,
+};
 use crate::python::conversion::{rust_row_to_py, try_convert_to_rust_obj};
+use crate::python::schema::infer_schema_inner;
 use crate::python::expr::{ExprOp, PyExpr, PyFieldExpr};
 use crate::python::fastpath::{
     count_by_field, count_by_field_py, count_lazy_float_list, count_numpy_f32, count_numpy_f64,
@@ -18,22 +22,22 @@ use crate::python::fastpath::{
 use crate::python::io_bridge::{csv_col_spec, parse_csv, parse_jsonl};
 use crate::io::ParsedOutput;
 use crate::core::{
-    count_fused_f64_bounded, count_fused_i64_bounded, count_obj_pipeline, eval_filter_f64,
-    eval_filter_i64, execute_fused_f64_bounded, execute_fused_i64_bounded, execute_obj_pipeline,
-    filter_multi_stat_f64, max_fused_f64_bounded, mean_fused_f64_bounded, min_fused_f64_bounded,
-    row_passes, stats_fused_f64_bounded, sum_field_obj_pipeline, sum_fused_f64_bounded,
-    var_fused_f64_bounded, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
+    count_fused_f64_with_skip_take, count_fused_i64_with_skip_take, count_obj_pipeline, eval_filter_f64,
+    eval_filter_i64, execute_fused_f64_with_skip_take, execute_fused_i64_with_skip_take, execute_obj_pipeline,
+    filter_multi_stat_f64, max_fused_f64_with_skip_take, mean_fused_f64_with_skip_take, min_fused_f64_with_skip_take,
+    row_passes, stats_fused_f64_with_skip_take, sum_field_obj_pipeline, sum_fused_f64_with_skip_take,
+    var_fused_f64_with_skip_take, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
     RustValue,
 };
 use super::{
     agg_build_result, agg_init_acc, agg_update, apply_py_filter, apply_py_filter_f64,
     apply_py_filter_i64, apply_py_map, apply_py_map_f64, apply_py_map_i64, apply_skip_take,
     bind_ops, branch_f64_pipeline, branch_i64_pipeline, clone_inner, collect_f64_pipeline,
-    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_bounded, execute_f64,
-    execute_i64, execute_u8, execute_u8_bounded, expr_to_int_op, group_agg_field_count,
+    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_with_skip_take, execute_f64,
+    execute_i64, execute_u8, execute_u8_with_skip_take, expr_to_int_op, group_agg_field_count,
     group_by_collect as group_by_collect_fn, group_key_from_rust_value, group_key_to_py,
-    group_keys_to_py, native_slice_as_bytes, native_vec_to_numpy, parsed_to_query,
-    push_numeric_op, sum_u8_bounded, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, MappedResult, MappedResultI, PyPipelineOp, PyQuery, QueryInner, take_query,
+    group_keys_to_py, native_slice_as_bytes, parsed_to_query,
+    push_numeric_op, sum_u8_with_skip_take, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, MappedResult, MappedResultI, PyPipelineOp, PyQuery, QueryInner, take_query,
 };
 use ahash::AHashMap;
 use std::sync::Arc;
@@ -314,6 +318,16 @@ impl PyQuery {
                     ops: vec![PyPipelineOp::Map(f.unbind())],
                 }))
             }
+            QueryInner::ColumnarObj { data, ops } => {
+                // Materialize to dicts, then apply map as Obj pipeline
+                let indices = apply_columnar_ops(data, ops, self.skip, self.take);
+                let rows = columnar_indices_to_py_list(py, data, &indices)?;
+                let mat = PyList::new_bound(py, rows.iter().map(|o| o.bind(py)));
+                Ok(PyQuery::from_inner(QueryInner::Obj {
+                    source: mat.unbind().into_py(py),
+                    ops: vec![PyPipelineOp::Map(f.unbind())],
+                }))
+            }
             QueryInner::Empty => Ok(PyQuery::from_inner(QueryInner::Empty)),
         }
     }
@@ -334,14 +348,36 @@ impl PyQuery {
         Ok(PyQuery::from_inner(QueryInner::Py(out)))
     }
 
-    /// Convert a dict-list Obj pipeline to RustObj eagerly.
-    /// Use this to pay the import cost once when the same dataset will be queried many times:
-    ///   q = Query(logs).preload()    # converts once
-    ///   q.filter(field("x") > 5).count()  # GIL-free, runs in microseconds
+    /// Convert a dict-list pipeline to columnar layout (spec-082 T4).
+    ///
+    /// Pays the conversion cost once so repeated `field()` DSL queries run on
+    /// typed column slices with no per-row dict lookup.
+    ///
+    ///   q = Query(logs).preload()            # converts once — GIL, O(N)
+    ///   q.filter(field("score") > 5).count() # GIL-free column scan
+    ///
+    /// Falls back to `RustObj` if the source is not a list-of-dicts, and to
+    /// a no-op clone if the pipeline already has pending ops (they are applied
+    /// at terminal time as usual).
     fn preload(&self, py: Python<'_>) -> PyResult<PyQuery> {
         if let QueryInner::Obj { source, ops } = &self.inner {
             if ops.is_empty() {
                 if let Ok(list) = source.bind(py).downcast::<PyList>() {
+                    // Try columnar conversion first (spec-082 T4 primary path)
+                    let schema = infer_schema_inner(list, 100)?;
+                    if !schema.is_empty() {
+                        let columnar = convert_to_columnar(py, list, &schema)?;
+                        return Ok(PyQuery {
+                            inner: QueryInner::ColumnarObj {
+                                data: Arc::new(columnar),
+                                ops: Vec::new(),
+                            },
+                            skip: self.skip,
+                            take: self.take,
+                            parallel: self.parallel,
+                        });
+                    }
+                    // Non-dict list: fall back to RustObj
                     if let Some(rows) = try_convert_to_rust_obj(py, list)? {
                         return Ok(PyQuery {
                             inner: QueryInner::RustObj {

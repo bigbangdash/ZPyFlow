@@ -1,4 +1,4 @@
-"""I/O tests: from_numpy, from_arrow, from_csv, from_json_lines."""
+"""I/O tests: from_numpy, from_arrow, from_csv, from_csv_chunked, from_json_lines."""
 
 import pytest
 
@@ -139,13 +139,12 @@ class TestFromNumpy:
         result = from_numpy(arr).map(col * 2).to_list()
         assert result == pytest.approx([2.0, 4.0, 6.0])
 
-    def test_from_numpy_f32_to_numpy(self):
+    def test_from_numpy_f32_filter_values(self):
         import numpy as np
         from zpyflow import from_numpy
         arr = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-        out = from_numpy(arr).filter(col > 2).to_numpy()
-        assert out.dtype == np.float32
-        assert list(out) == pytest.approx([3.0, 4.0])
+        out = from_numpy(arr).filter(col > 2).to_list()
+        assert out == pytest.approx([3.0, 4.0])
 
     def test_from_numpy_f32_large(self):
         import numpy as np
@@ -400,3 +399,247 @@ class TestFromJsonLines:
         p.write_text(self.JSONL, encoding="utf-8")
         total = from_json_lines(p, field="price", dtype="float").sum()
         assert total == pytest.approx(4.70)
+
+
+@pytest.mark.skipif(not HAS_ARROW, reason="pyarrow not installed")
+class TestFromArrowIpc:
+    def _write_ipc_file(self, tmp_path, table, name="data.arrow"):
+        import pyarrow.ipc as ipc
+        p = tmp_path / name
+        with ipc.new_file(str(p), table.schema) as w:
+            for batch in table.to_batches():
+                w.write_batch(batch)
+        return p
+
+    def _write_ipc_stream(self, tmp_path, table, name="data.arrows"):
+        import pyarrow.ipc as ipc
+        p = tmp_path / name
+        with ipc.new_stream(str(p), table.schema) as w:
+            for batch in table.to_batches():
+                w.write_batch(batch)
+        return p
+
+    def test_single_column_f64_file_format(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"x": pa.array([1.0, 2.0, 3.0, 4.0, 5.0])})
+        p = self._write_ipc_file(tmp_path, table)
+        result = from_arrow_ipc(p).to_list()
+        assert result == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+
+    def test_single_column_f64_stream_format(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"x": pa.array([10.0, 20.0, 30.0])})
+        p = self._write_ipc_stream(tmp_path, table)
+        result = from_arrow_ipc(p).to_list()
+        assert result == pytest.approx([10.0, 20.0, 30.0])
+
+    def test_single_column_auto_extract_filter(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc, col
+        table = pa.table({"v": pa.array([1.0, 2.0, 3.0, 4.0, 5.0])})
+        p = self._write_ipc_file(tmp_path, table)
+        count = from_arrow_ipc(p).filter(col > 3.0).count()
+        assert count == 2
+
+    def test_multi_column_dict_rows(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"name": ["alice", "bob"], "score": [0.9, 0.4]})
+        p = self._write_ipc_file(tmp_path, table)
+        rows = from_arrow_ipc(p).to_list()
+        assert len(rows) == 2
+        assert rows[0]["name"] == "alice"
+        assert rows[0]["score"] == pytest.approx(0.9)
+
+    def test_column_by_name(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"a": [1.0, 2.0], "b": [10.0, 20.0]})
+        p = self._write_ipc_file(tmp_path, table)
+        result = from_arrow_ipc(p, column="b").to_list()
+        assert result == pytest.approx([10.0, 20.0])
+
+    def test_column_by_index(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"a": [1.0, 2.0], "b": [10.0, 20.0]})
+        p = self._write_ipc_file(tmp_path, table)
+        result = from_arrow_ipc(p, column=1).to_list()
+        assert result == pytest.approx([10.0, 20.0])
+
+    def test_i64_column_zero_copy(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc, col
+        table = pa.table({"n": pa.array([10, 20, 30, 40], type=pa.int64())})
+        p = self._write_ipc_file(tmp_path, table)
+        result = from_arrow_ipc(p).filter(col > 15).to_list()
+        assert result == [20, 30, 40]
+
+    def test_path_string_input(self, tmp_path):
+        import pyarrow as pa
+        from zpyflow import from_arrow_ipc
+        table = pa.table({"x": [1.0, 2.0, 3.0]})
+        p = self._write_ipc_file(tmp_path, table)
+        result = from_arrow_ipc(str(p)).to_list()
+        assert result == pytest.approx([1.0, 2.0, 3.0])
+
+    def test_missing_pyarrow_raises(self, tmp_path, monkeypatch):
+        import sys
+        from zpyflow import from_arrow_ipc
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        monkeypatch.setitem(sys.modules, "pyarrow.ipc", None)
+        with pytest.raises((ImportError, TypeError)):
+            from_arrow_ipc(tmp_path / "nonexistent.arrow")
+
+
+class TestFromCsvChunked:
+    CSV_WITH_HEADER = "name,score,active\nalice,0.9,true\nbob,0.4,false\ncarol,0.7,true\ndan,0.2,false\neve,0.8,true\n"
+    CSV_NO_HEADER = "alice,0.9\nbob,0.4\ncarol,0.7\n"
+
+    def test_chunk_boundaries(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        chunks = list(from_csv_chunked(p, chunk_size=2))
+        assert len(chunks) == 3
+        assert chunks[0].count() == 2
+        assert chunks[1].count() == 2
+        assert chunks[2].count() == 1
+
+    def test_total_row_count(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        total = sum(q.count() for q in from_csv_chunked(p, chunk_size=2))
+        assert total == 5
+
+    def test_dict_rows_default(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        chunks = list(from_csv_chunked(p, chunk_size=10))
+        assert len(chunks) == 1
+        rows = chunks[0].to_list()
+        assert rows[0]["name"] == "alice"
+        assert rows[0]["score"] == pytest.approx(0.9)
+
+    def test_column_by_name(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        values = []
+        for q in from_csv_chunked(p, chunk_size=2, column="score"):
+            values.extend(q.to_list())
+        assert values == pytest.approx([0.9, 0.4, 0.7, 0.2, 0.8])
+
+    def test_column_by_index(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        values = []
+        for q in from_csv_chunked(p, chunk_size=3, column=1):
+            values.extend(q.to_list())
+        assert values == pytest.approx([0.9, 0.4, 0.7, 0.2, 0.8])
+
+    def test_dtype_float(self, tmp_path):
+        from zpyflow import from_csv_chunked, col
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        total = sum(
+            q.filter(col > 0.5).sum()
+            for q in from_csv_chunked(p, chunk_size=2, column="score", dtype="float")
+        )
+        assert total == pytest.approx(0.9 + 0.7 + 0.8)
+
+    def test_field_dsl_filter(self, tmp_path):
+        from zpyflow import from_csv_chunked, field
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        results = []
+        for q in from_csv_chunked(p, chunk_size=2):
+            results.extend(q.filter(field("score") > 0.5).to_list())
+        names = [r["name"] for r in results]
+        assert names == ["alice", "carol", "eve"]
+
+    def test_file_like_input(self):
+        import io
+        from zpyflow import from_csv_chunked
+        f = io.StringIO(self.CSV_WITH_HEADER)
+        chunks = list(from_csv_chunked(f, chunk_size=3))
+        assert len(chunks) == 2
+        assert sum(q.count() for q in chunks) == 5
+
+    def test_no_header_mode(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_NO_HEADER, encoding="utf-8")
+        chunks = list(from_csv_chunked(p, has_header=False))
+        assert len(chunks) == 1
+        rows = chunks[0].to_list()
+        assert rows[0][0] == "alice"
+        assert rows[0][1] == pytest.approx(0.9)
+
+    def test_no_header_column_by_index(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_NO_HEADER, encoding="utf-8")
+        values = []
+        for q in from_csv_chunked(p, has_header=False, column=1, dtype="float"):
+            values.extend(q.to_list())
+        assert values == pytest.approx([0.9, 0.4, 0.7])
+
+    def test_invalid_chunk_size(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        with pytest.raises(ValueError, match="chunk_size"):
+            list(from_csv_chunked(p, chunk_size=0))
+
+    def test_missing_column_name_raises(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        with pytest.raises(ValueError, match="not found"):
+            list(from_csv_chunked(p, column="nonexistent"))
+
+    def test_empty_csv_yields_nothing(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text("name,score\n", encoding="utf-8")
+        chunks = list(from_csv_chunked(p))
+        assert chunks == []
+
+    def test_single_row_csv(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text("x\n42\n", encoding="utf-8")
+        chunks = list(from_csv_chunked(p, chunk_size=100))
+        assert len(chunks) == 1
+        assert chunks[0].to_list() == [{"x": 42}]
+
+    def test_custom_delimiter(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.tsv"
+        p.write_text("name\tval\nalice\t1.5\nbob\t2.5\n", encoding="utf-8")
+        chunks = list(from_csv_chunked(p, delimiter="\t"))
+        rows = chunks[0].to_list()
+        assert rows[0]["name"] == "alice"
+        assert rows[1]["val"] == pytest.approx(2.5)
+
+    def test_type_coercion_int(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text("id,count\n1,10\n2,20\n", encoding="utf-8")
+        chunks = list(from_csv_chunked(p))
+        rows = chunks[0].to_list()
+        assert isinstance(rows[0]["id"], int)
+        assert isinstance(rows[0]["count"], int)
+
+    def test_from_path_string(self, tmp_path):
+        from zpyflow import from_csv_chunked
+        p = tmp_path / "data.csv"
+        p.write_text(self.CSV_WITH_HEADER, encoding="utf-8")
+        chunks = list(from_csv_chunked(str(p)))
+        assert sum(q.count() for q in chunks) == 5

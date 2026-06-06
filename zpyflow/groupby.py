@@ -22,32 +22,14 @@ U = TypeVar("U")
 
 
 # ---------------------------------------------------------------------------
-# Structured aggregation spec factory functions
+# Structured aggregation spec factory functions — direct aliases to Rust
 # ---------------------------------------------------------------------------
 
-def agg_count() -> AggSpec:
-    """Count elements in each group."""
-    return AggSpec.count()
-
-
-def agg_sum(field_fn: Callable[[Any], float]) -> AggSpec:
-    """Sum `field_fn(item)` over each group."""
-    return AggSpec.sum(field_fn)
-
-
-def agg_mean(field_fn: Callable[[Any], float]) -> AggSpec:
-    """Mean of `field_fn(item)` over each group."""
-    return AggSpec.mean(field_fn)
-
-
-def agg_max(field_fn: Callable[[Any], float]) -> AggSpec:
-    """Maximum of `field_fn(item)` over each group."""
-    return AggSpec.max(field_fn)
-
-
-def agg_min(field_fn: Callable[[Any], float]) -> AggSpec:
-    """Minimum of `field_fn(item)` over each group."""
-    return AggSpec.min(field_fn)
+agg_count = AggSpec.count
+agg_sum   = AggSpec.sum
+agg_mean  = AggSpec.mean
+agg_max   = AggSpec.max
+agg_min   = AggSpec.min
 
 
 class GroupBy(Generic[K, T]):

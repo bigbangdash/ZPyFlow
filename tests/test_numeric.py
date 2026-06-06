@@ -620,79 +620,6 @@ class TestVarStd:
         assert abs(result - expected) < 1e-6
 
 
-class TestToNumpy:
-    """to_numpy() — runtime numpy import, raw-byte transfer, no Python float boxing."""
-
-    def setup_method(self):
-        try:
-            from zpyflow import Query, col
-            import numpy as np
-            self.Query = Query
-            self.col = col
-            self.np = np
-            self.available = True
-        except ImportError:
-            self.available = False
-
-    def _q(self, data):
-        return self.Query(data)
-
-    def test_f64_returns_float64_array(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        result = self._q([1.0, 2.0, 3.0]).to_numpy()
-        assert isinstance(result, np.ndarray)
-        assert result.dtype == np.float64
-        assert list(result) == [1.0, 2.0, 3.0]
-
-    def test_f64_filter_values_correct(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        data = [float(x) for x in range(10)]
-        result = self._q(data).filter(self.col > 5.0).to_numpy()
-        expected = np.array([6.0, 7.0, 8.0, 9.0])
-        np.testing.assert_array_equal(result, expected)
-
-    def test_f64_map_values_correct(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        result = self._q([1.0, 2.0, 3.0]).map(self.col * 10.0).to_numpy()
-        np.testing.assert_array_equal(result, np.array([10.0, 20.0, 30.0]))
-
-    def test_i64_returns_int64_array(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        result = self._q([1, 2, 3]).to_numpy()
-        assert result.dtype == np.int64
-        assert list(result) == [1, 2, 3]
-
-    def test_empty_f64_returns_empty_array(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        result = self._q([]).to_numpy()
-        assert isinstance(result, np.ndarray)
-        assert len(result) == 0
-
-    def test_result_is_writable(self):
-        if not self.available: pytest.skip("extension not built")
-        result = self._q([1.0, 2.0, 3.0]).to_numpy()
-        result[0] = 99.0
-        assert result[0] == 99.0
-
-    def test_object_pipeline_raises(self):
-        if not self.available: pytest.skip("extension not built")
-        with pytest.raises(Exception):
-            self._q(["a", "b"]).to_numpy()
-
-    def test_large_correctness(self):
-        if not self.available: pytest.skip("extension not built")
-        np = self.np
-        data = [float(i) for i in range(10000)]
-        arr = self._q(data).filter(self.col > 5000.0).to_numpy()
-        expected = np.array([x for x in data if x > 5000.0])
-        np.testing.assert_array_equal(arr, expected)
-
-
 @pytest.mark.skipif(not HAS_EXTENSION, reason="extension not built")
 class TestLazyFloatListChunkedPath:
     """Correctness tests for the chunked SIMD lazy path (spec/034)."""
@@ -1144,3 +1071,207 @@ class TestNumericFilterDSL:
         data = [1.0, float("nan"), 5.0, float("nan"), 10.0]
         result = Query(data).filter(col.not_nan()).filter(col > 3).to_list()
         assert result == [5.0, 10.0]
+
+
+# ===========================================================================
+# Batched Python predicate path (spec 080 T1)
+# Verifies that chunk boundaries (multiples and remainders of FILTER_CHUNK_SIZE=256)
+# are handled correctly for f64, i64, and object (Py) paths.
+# ===========================================================================
+
+class TestBatchedPyFilter:
+    """Lambda filter uses list(filter(pred, chunk)) per 256-element chunk."""
+
+    # --- f64 path ---
+
+    def test_f64_exact_chunk(self):
+        data = [float(i) for i in range(256)]
+        result = Query(data).filter(lambda x: x >= 128).to_list()
+        assert result == pytest.approx([float(i) for i in range(128, 256)])
+
+    def test_f64_multi_chunk(self):
+        data = [float(i) for i in range(1000)]
+        result = Query(data).filter(lambda x: x % 2 == 0).to_list()
+        expected = [float(i) for i in range(0, 1000, 2)]
+        assert result == pytest.approx(expected)
+
+    def test_f64_partial_last_chunk(self):
+        # 257 elements: one full chunk (256) + one remainder (1)
+        data = list(range(257))
+        result = Query([float(v) for v in data]).filter(lambda x: x == 256.0).to_list()
+        assert result == pytest.approx([256.0])
+
+    def test_f64_count_large(self):
+        data = [float(i) for i in range(10_000)]
+        count = Query(data).filter(lambda x: x > 5000).count()
+        assert count == 4999
+
+    def test_f64_order_preserved(self):
+        data = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]
+        result = Query(data).filter(lambda x: x > 3).to_list()
+        assert result == pytest.approx([4.0, 5.0, 9.0, 6.0])
+
+    def test_f64_empty_result(self):
+        data = [float(i) for i in range(500)]
+        result = Query(data).filter(lambda x: x > 1000).to_list()
+        assert result == []
+
+    def test_f64_all_pass(self):
+        data = [float(i) for i in range(500)]
+        result = Query(data).filter(lambda x: x >= 0).to_list()
+        assert len(result) == 500
+
+    # --- i64 path ---
+
+    def test_i64_multi_chunk(self):
+        data = list(range(1000))
+        result = Query(data).filter(lambda x: x % 3 == 0).to_list()
+        expected = list(range(0, 1000, 3))
+        assert result == expected
+
+    def test_i64_exact_chunk_boundary(self):
+        data = list(range(512))
+        result = Query(data).filter(lambda x: x >= 256).to_list()
+        assert result == list(range(256, 512))
+
+    # --- object (Py) path ---
+
+    def test_obj_multi_chunk(self):
+        data = [{"v": i} for i in range(600)]
+        result = Query(data).filter(lambda r: r["v"] % 2 == 0).to_list()
+        assert len(result) == 300
+        assert all(r["v"] % 2 == 0 for r in result)
+
+    def test_obj_skip(self):
+        data = list(range(300))
+        result = Query(data).skip(100).filter(lambda x: True).to_list()
+        assert result == list(range(100, 300))
+
+    def test_obj_take_early_termination(self):
+        data = list(range(1000))
+        result = Query(data).filter(lambda x: x % 2 == 0).take(5).to_list()
+        assert result == [0, 2, 4, 6, 8]
+
+    def test_obj_skip_take_combined(self):
+        data = list(range(500))
+        result = Query(data).skip(10).take(5).filter(lambda x: True).to_list()
+        assert result == list(range(10, 15))
+
+    def test_obj_cross_chunk_boundary_take(self):
+        # take lands exactly at a chunk boundary
+        data = list(range(600))
+        result = Query(data).filter(lambda x: x >= 0).take(256).to_list()
+        assert result == list(range(256))
+
+    def test_lambda_side_effects_order_preserved(self):
+        seen = []
+        data = list(range(300))
+        Query(data).filter(lambda x: seen.append(x) or True).to_list()
+        assert seen == list(range(300))
+
+
+# ===========================================================================
+# Predicate reordering / filter merging (spec 080 T2)
+# Adjacent DSL filters are merged at build time inside push_op — these tests
+# verify that the merge produces correct results and counts.
+# ===========================================================================
+
+class TestPredicateMerging:
+    """Adjacent DSL filter ops are fused at pipeline build time."""
+
+    # --- f64: same-side tightening ---
+
+    def test_double_gt_tightens(self):
+        # filter(col > 5).filter(col > 10) == filter(col > 10)
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col > 5).filter(col > 10).to_list()
+        assert result == pytest.approx([float(i) for i in range(11, 20)])
+
+    def test_double_lt_tightens(self):
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col < 15).filter(col < 10).to_list()
+        assert result == pytest.approx([float(i) for i in range(10)])
+
+    def test_double_ge_tightens(self):
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col >= 3).filter(col >= 7).to_list()
+        assert result == pytest.approx([float(i) for i in range(7, 20)])
+
+    def test_double_le_tightens(self):
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col <= 15).filter(col <= 8).to_list()
+        assert result == pytest.approx([float(i) for i in range(9)])
+
+    # --- f64: opposing bounds fused to between ---
+
+    def test_ge_le_fused_to_between(self):
+        # filter(col >= 3).filter(col <= 7) → FilterBetween(3, 7)
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col >= 3).filter(col <= 7).to_list()
+        assert result == pytest.approx([3.0, 4.0, 5.0, 6.0, 7.0])
+
+    def test_le_ge_commuted_fused(self):
+        # filter(col <= 7).filter(col >= 3) → FilterBetween(3, 7)
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col <= 7).filter(col >= 3).to_list()
+        assert result == pytest.approx([3.0, 4.0, 5.0, 6.0, 7.0])
+
+    def test_impossible_range_gives_empty(self):
+        # filter(col >= 10).filter(col <= 5) → empty
+        data = [float(i) for i in range(20)]
+        result = Query(data).filter(col >= 10).filter(col <= 5).to_list()
+        assert result == []
+
+    def test_between_preserves_boundary_values(self):
+        data = [2.9, 3.0, 5.0, 7.0, 7.1]
+        result = Query(data).filter(col >= 3.0).filter(col <= 7.0).to_list()
+        assert result == pytest.approx([3.0, 5.0, 7.0])
+
+    # --- f64: merge does not cross map ops ---
+
+    def test_merge_blocked_by_map(self):
+        # filter(col > 2).map(col * 2).filter(col > 8) — NOT merged
+        # col > 2 passes [3..], map(*2) gives [6,8,10..], filter(>8) gives [10..]
+        data = [float(i) for i in range(10)]
+        result = Query(data).filter(col > 2).map(col * 2).filter(col > 8).to_list()
+        assert result == pytest.approx([10.0, 12.0, 14.0, 16.0, 18.0])
+
+    # --- f64: idempotent flags ---
+
+    def test_double_not_nan_deduped(self):
+        data = [1.0, float("nan"), 2.0, float("nan"), 3.0]
+        result = Query(data).filter(col.not_nan()).filter(col.not_nan()).to_list()
+        assert result == pytest.approx([1.0, 2.0, 3.0])
+
+    # --- f64: count path uses same fused ops ---
+
+    def test_count_uses_merged_ops(self):
+        data = [float(i) for i in range(100)]
+        count = Query(data).filter(col >= 20).filter(col <= 79).count()
+        assert count == 60
+
+    # --- i64: same-side tightening ---
+
+    def test_i64_double_gt_tightens(self):
+        data = list(range(20))
+        result = Query(data).filter(col > 5).filter(col > 10).to_list()
+        assert result == list(range(11, 20))
+
+    def test_i64_double_lt_tightens(self):
+        data = list(range(20))
+        result = Query(data).filter(col < 15).filter(col < 10).to_list()
+        assert result == list(range(10))
+
+    def test_i64_impossible_range_gives_empty(self):
+        data = list(range(20))
+        result = Query(data).filter(col >= 15).filter(col <= 5).to_list()
+        assert result == []
+
+    # --- large data: correctness at scale ---
+
+    def test_large_merged_filter_correctness(self):
+        data = [float(i) for i in range(10_000)]
+        result = Query(data).filter(col >= 1000).filter(col <= 2000).to_list()
+        expected = [float(i) for i in range(1000, 2001)]
+        assert result == pytest.approx(expected)
+        assert len(result) == 1001

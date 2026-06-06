@@ -180,7 +180,8 @@ class TestRustObj:
 
     def test_preload(self, products):
         q = Query(products).preload()
-        assert "rust_obj" in repr(q)
+        # preload() produces columnar_obj (spec 082) or rust_obj for non-uniform schemas
+        assert "rust_obj" in repr(q) or "columnar_obj" in repr(q)
         assert "lazy" not in repr(q)
         assert q.filter(field("active") == True).count() == 3
 
@@ -627,3 +628,230 @@ class TestValueCounts:
     def test_no_duplicates(self):
         result = Query([1, 2, 3]).value_counts()
         assert result == {1: 1, 2: 1, 3: 1}
+
+
+# ===========================================================================
+# spec 084 T1-T4: join (inner, left, right, cross)
+# ===========================================================================
+
+class TestJoinNew:
+    ORDERS   = [{"id": 1, "item": "A"}, {"id": 2, "item": "B"}, {"id": 3, "item": "C"}]
+    DETAILS  = [{"id": 1, "price": 9.9}, {"id": 2, "price": 4.5}]
+    DETAILS2 = [{"id": 1, "price": 9.9}, {"id": 1, "price": 8.0}]  # duplicate right key
+
+    # --- inner join ---
+
+    def test_inner_basic(self):
+        result = Query(self.ORDERS).join(Query(self.DETAILS), on="id").to_list()
+        assert len(result) == 2
+        assert result[0] == {"id": 1, "item": "A", "price": 9.9}
+        assert result[1] == {"id": 2, "item": "B", "price": 4.5}
+
+    def test_inner_no_match(self):
+        other = Query([{"id": 99, "price": 1.0}])
+        result = Query(self.ORDERS).join(other, on="id").to_list()
+        assert result == []
+
+    def test_inner_right_wins_on_collision(self):
+        # both sides have "id" — right value should overwrite left
+        left  = Query([{"id": 1, "v": "left"}])
+        right = Query([{"id": 1, "v": "right"}])
+        result = left.join(right, on="id").to_list()
+        assert result[0]["v"] == "right"
+
+    def test_inner_duplicate_right_key(self):
+        result = Query([{"id": 1, "item": "A"}]).join(Query(self.DETAILS2), on="id").to_list()
+        assert len(result) == 2
+
+    def test_inner_callable_key(self):
+        left  = Query([{"x": 1}, {"x": 2}])
+        right = Query([{"y": 2, "z": 99}])
+        result = left.join(right, on=(lambda r: r["x"], lambda r: r["y"])).to_list()
+        assert result == [{"x": 2, "y": 2, "z": 99}]
+
+    def test_inner_empty_left(self):
+        result = Query([]).join(Query(self.DETAILS), on="id").to_list()
+        assert result == []
+
+    def test_inner_empty_right(self):
+        result = Query(self.ORDERS).join(Query([]), on="id").to_list()
+        assert result == []
+
+    def test_inner_integer_key(self):
+        left  = Query([{"k": 10}, {"k": 20}])
+        right = Query([{"k": 10, "v": "hit"}])
+        result = left.join(right, on="k").to_list()
+        assert len(result) == 1
+        assert result[0]["v"] == "hit"
+
+    # --- left join ---
+
+    def test_left_all_left_rows_preserved(self):
+        result = Query(self.ORDERS).join(Query(self.DETAILS), on="id", how="left").to_list()
+        assert len(result) == 3
+
+    def test_left_unmatched_right_fields_are_none(self):
+        result = Query(self.ORDERS).join(Query(self.DETAILS), on="id", how="left").to_list()
+        unmatched = [r for r in result if r["id"] == 3]
+        assert len(unmatched) == 1
+        assert unmatched[0]["price"] is None
+
+    def test_left_matched_rows_merged(self):
+        result = Query(self.ORDERS).join(Query(self.DETAILS), on="id", how="left").to_list()
+        matched = [r for r in result if r["id"] == 1]
+        assert matched[0]["price"] == pytest.approx(9.9)
+
+    # --- right join ---
+
+    def test_right_all_right_rows_preserved(self):
+        details = [{"id": 1, "price": 9.9}, {"id": 99, "price": 1.0}]
+        result = Query(self.ORDERS).join(Query(details), on="id", how="right").to_list()
+        assert len(result) == 2
+        right_only = [r for r in result if r["id"] == 99]
+        assert right_only[0]["item"] is None
+
+    def test_right_matched_rows_merged(self):
+        result = Query(self.ORDERS).join(Query(self.DETAILS), on="id", how="right").to_list()
+        assert len(result) == 2
+        assert all("item" in r and "price" in r for r in result)
+
+    # --- cross join ---
+
+    def test_cross_cartesian(self):
+        left  = Query([{"a": 1}, {"a": 2}])
+        right = Query([{"b": "x"}, {"b": "y"}])
+        result = left.join(right, how="cross").to_list()
+        assert len(result) == 4
+        assert {"a": 1, "b": "x"} in result
+        assert {"a": 2, "b": "y"} in result
+
+    def test_cross_empty(self):
+        result = Query([{"a": 1}]).join(Query([]), how="cross").to_list()
+        assert result == []
+
+    # --- error cases ---
+
+    def test_missing_on_raises(self):
+        with pytest.raises(ValueError, match="on="):
+            Query([{"id": 1}]).join(Query([{"id": 1}])).to_list()
+
+    def test_unknown_how_raises(self):
+        with pytest.raises(ValueError, match="how="):
+            Query([{"id": 1}]).join(Query([{"id": 1}]), on="id", how="full").to_list()
+
+
+# ===========================================================================
+# spec 084 T5: window (size, step)
+# ===========================================================================
+
+class TestWindow:
+    def test_rolling_default_step(self):
+        result = Query([1, 2, 3, 4, 5]).window(3).to_list()
+        assert result == [[1, 2, 3], [2, 3, 4], [3, 4, 5]]
+
+    def test_tumbling_step_equals_size(self):
+        result = Query([1, 2, 3, 4]).window(2, step=2).to_list()
+        assert result == [[1, 2], [3, 4]]
+
+    def test_step_larger_than_size(self):
+        result = Query([1, 2, 3, 4, 5]).window(2, step=3).to_list()
+        assert result == [[1, 2], [4, 5]]
+
+    def test_window_larger_than_data(self):
+        result = Query([1, 2]).window(5).to_list()
+        assert result == []
+
+    def test_window_size_equals_data(self):
+        result = Query([1, 2, 3]).window(3).to_list()
+        assert result == [[1, 2, 3]]
+
+    def test_step_one_single_element_data(self):
+        result = Query([42]).window(1).to_list()
+        assert result == [[42]]
+
+    def test_invalid_size_raises(self):
+        with pytest.raises(ValueError, match="size"):
+            Query([1, 2, 3]).window(0).to_list()
+
+    def test_invalid_step_raises(self):
+        with pytest.raises(ValueError, match="step"):
+            Query([1, 2, 3]).window(2, step=0).to_list()
+
+    def test_window_preserves_order(self):
+        data = list(range(6))
+        result = Query(data).window(2).to_list()
+        assert result == [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]]
+
+    def test_window_on_dicts(self):
+        data = [{"v": i} for i in range(4)]
+        result = Query(data).window(2).to_list()
+        assert len(result) == 3
+        assert result[0] == [{"v": 0}, {"v": 1}]
+
+
+# ===========================================================================
+# spec 084 T6: rolling_sum / rolling_mean
+# ===========================================================================
+
+class TestRollingAggregates:
+    def test_rolling_sum_basic(self):
+        result = Query([1.0, 2.0, 3.0, 4.0]).rolling_sum(2).to_list()
+        assert result == pytest.approx([3.0, 5.0, 7.0])
+
+    def test_rolling_mean_basic(self):
+        result = Query([1.0, 2.0, 3.0, 4.0]).rolling_mean(2).to_list()
+        assert result == pytest.approx([1.5, 2.5, 3.5])
+
+    def test_rolling_sum_window_equals_length(self):
+        result = Query([1.0, 2.0, 3.0]).rolling_sum(3).to_list()
+        assert result == pytest.approx([6.0])
+
+    def test_rolling_mean_window_equals_length(self):
+        result = Query([1.0, 2.0, 3.0]).rolling_mean(3).to_list()
+        assert result == pytest.approx([2.0])
+
+    def test_rolling_sum_window_larger_than_data(self):
+        result = Query([1.0, 2.0]).rolling_sum(5).to_list()
+        assert result == []
+
+    def test_rolling_mean_window_larger_than_data(self):
+        result = Query([1.0, 2.0]).rolling_mean(5).to_list()
+        assert result == []
+
+    def test_rolling_sum_large(self):
+        data = [float(i) for i in range(1000)]
+        result = Query(data).rolling_sum(3).to_list()
+        assert len(result) == 998
+        assert result[0] == pytest.approx(0 + 1 + 2)
+        assert result[-1] == pytest.approx(997 + 998 + 999)
+
+    def test_rolling_mean_large(self):
+        data = [float(i) for i in range(1000)]
+        result = Query(data).rolling_mean(4).to_list()
+        assert len(result) == 997
+        assert result[0] == pytest.approx((0 + 1 + 2 + 3) / 4)
+
+    def test_rolling_sum_integer_data(self):
+        # i64 path falls back to Python
+        data = list(range(5))
+        result = Query(data).rolling_sum(2).to_list()
+        assert result == pytest.approx([1.0, 3.0, 5.0, 7.0])
+
+    def test_rolling_mean_integer_data(self):
+        data = list(range(5))
+        result = Query(data).rolling_mean(2).to_list()
+        assert result == pytest.approx([0.5, 1.5, 2.5, 3.5])
+
+    def test_rolling_sum_invalid_window(self):
+        with pytest.raises((ValueError, Exception)):
+            Query([1.0, 2.0]).rolling_sum(0).to_list()
+
+    def test_rolling_mean_invalid_window(self):
+        with pytest.raises((ValueError, Exception)):
+            Query([1.0, 2.0]).rolling_mean(0).to_list()
+
+    def test_rolling_after_filter(self):
+        data = [float(i) for i in range(10)]
+        result = Query(data).filter(col > 4).rolling_sum(3).to_list()
+        # [5,6,7,8,9] → rolling_sum(3) = [18, 21, 24]
+        assert result == pytest.approx([18.0, 21.0, 24.0])

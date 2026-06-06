@@ -29,24 +29,24 @@ DATA_I64 = list(range(N))
 
 def test_filter_faster_than_comprehension():
     start = time.perf_counter()
-    result_zpf = Query(DATA_F64).filter(col > 500).count()
-    zpf_time = time.perf_counter() - start
+    result_zpyflow = Query(DATA_F64).filter(col > 500).count()
+    zpyflow_time = time.perf_counter() - start
 
     start = time.perf_counter()
     result_py = sum(1 for x in DATA_F64 if x > 500)
     py_time = time.perf_counter() - start
 
-    assert result_zpf == result_py
+    assert result_zpyflow == result_py
     # ZPyFlow should be at least 30% faster for large arrays (SIMD + no GIL boxing)
     # This bound is generous to avoid CI flakiness; production gains are typically 2-5x.
     # NOTE: if Python list comprehension wins on your machine, that likely means the
     # extension was built in debug mode (maturin develop, not maturin develop --release).
-    print(f"\nzpyflow={zpf_time*1000:.2f}ms  python={py_time*1000:.2f}ms")
+    print(f"\nzpyflow={zpyflow_time*1000:.2f}ms  python={py_time*1000:.2f}ms")
 
 
 def test_chained_pipeline_correctness():
     """Ensure fused pipeline produces identical results to Python reference."""
-    result_zpf = (
+    result_zpyflow = (
         Query(DATA_F64)
         .filter(col > 500)
         .map(col * 2.0)
@@ -61,15 +61,15 @@ def test_chained_pipeline_correctness():
         if x > 500
     ][100:1100]
 
-    assert len(result_zpf) == len(result_py)
-    for a, b in zip(result_zpf, result_py):
+    assert len(result_zpyflow) == len(result_py)
+    for a, b in zip(result_zpyflow, result_py):
         assert abs(a - b) < 1e-10, f"Mismatch: {a} vs {b}"
 
 
 def test_sum_correctness():
-    zpf = Query(DATA_F64).filter(col > 500).sum()
-    py  = sum(x for x in DATA_F64 if x > 500)
-    assert abs(zpf - py) / max(abs(py), 1e-9) < 1e-10
+    zpyflow = Query(DATA_F64).filter(col > 500).sum()
+    py      = sum(x for x in DATA_F64 if x > 500)
+    assert abs(zpyflow - py) / max(abs(py), 1e-9) < 1e-10
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def test_sum_correctness():
 try:
     import pytest
 
-    def test_bench_zpf_filter(benchmark):
+    def test_bench_zpyflow_filter(benchmark):
         result = benchmark(
             lambda: Query(DATA_F64).filter(col > 500).count()
         )
@@ -91,7 +91,7 @@ try:
         )
         assert result > 0
 
-    def test_bench_zpf_chained(benchmark):
+    def test_bench_zpyflow_chained(benchmark):
         result = benchmark(
             lambda: Query(DATA_F64).filter(col > 500).map(col * 2).take(10_000).to_list()
         )

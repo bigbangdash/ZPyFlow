@@ -530,3 +530,111 @@ class TestFieldDslGranularity:
         benchmark.group = "field DSL granularity N=1M"
         result = benchmark(lambda: rust_query_xl.filter(field("latency_ms") > 100.0).count())
         assert result >= 0
+
+
+# ---------------------------------------------------------------------------
+# ColumnarObj — spec-082 T5
+#
+# Measures the columnar layout path introduced by .preload() → ColumnarObj.
+#
+# cold = preload() + filter + terminal inside the timed section.
+#        Includes the O(N × fields) schema-inference + columnar conversion cost.
+#        Representative of single-use per-request processing.
+#
+# warm = Query(data).preload() called once at session scope; only the filter
+#        + terminal is timed.  Representative of a dataset queried many times.
+#
+# All three styles (Python native / ZPyFlow lambda / ColumnarObj DSL) share
+# the same group so they appear side-by-side in the benchmark report.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def columnar_query_xl(logs_xl):
+    """Pre-built ColumnarObj for N=1M — pays conversion cost once per session."""
+    return Query(logs_xl).preload()
+
+
+class TestColumnarObjFilter:
+    """filter(latency_ms > 100) → to_list(): columnar cold vs warm vs Python.
+
+    to_list() output cost note: Python listcomp returns refs to original dicts
+    (zero-copy), while ColumnarObj reconstructs new Python dicts at output.
+    Use TestColumnarObjCount for a terminal without this asymmetry.
+    """
+
+    _THRESHOLD = 100.0
+
+    def test_python_native_xl(self, benchmark, logs_xl):
+        benchmark.group = "columnar filter N=1M"
+        t = self._THRESHOLD
+        result = benchmark(lambda: [l for l in logs_xl if l["latency_ms"] > t])
+        assert len(result) >= 0
+
+    def test_zpyflow_lambda_xl(self, benchmark, logs_xl):
+        """cold lambda: Obj pipeline (no columnar conversion)."""
+        benchmark.group = "columnar filter N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: Query(logs_xl).filter(lambda l: l["latency_ms"] > t).to_list()
+        )
+        assert len(result) >= 0
+
+    def test_field_dsl_cold_xl(self, benchmark, logs_xl):
+        """cold: preload (schema + conversion) + columnar filter + dict reconstruction."""
+        benchmark.group = "columnar filter N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: Query(logs_xl).preload().filter(field("latency_ms") > t).to_list()
+        )
+        assert len(result) >= 0
+
+    def test_field_dsl_warm_xl(self, benchmark, columnar_query_xl):
+        """warm: pre-built ColumnarObj — column scan + dict reconstruction only."""
+        benchmark.group = "columnar filter N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: columnar_query_xl.filter(field("latency_ms") > t).to_list()
+        )
+        assert len(result) >= 0
+
+
+class TestColumnarObjCount:
+    """count() — no dict reconstruction: cleanest comparison of scan throughput.
+
+    warm path runs entirely without Python dict access during the count.
+    """
+
+    _THRESHOLD = 100.0
+
+    def test_python_native_xl(self, benchmark, logs_xl):
+        benchmark.group = "columnar count N=1M"
+        t = self._THRESHOLD
+        result = benchmark(lambda: sum(1 for l in logs_xl if l["latency_ms"] > t))
+        assert result >= 0
+
+    def test_zpyflow_lambda_xl(self, benchmark, logs_xl):
+        """cold lambda: Obj pipeline count."""
+        benchmark.group = "columnar count N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: Query(logs_xl).filter(lambda l: l["latency_ms"] > t).count()
+        )
+        assert result >= 0
+
+    def test_field_dsl_cold_xl(self, benchmark, logs_xl):
+        """cold: preload + columnar count (conversion cost included)."""
+        benchmark.group = "columnar count N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: Query(logs_xl).preload().filter(field("latency_ms") > t).count()
+        )
+        assert result >= 0
+
+    def test_field_dsl_warm_xl(self, benchmark, columnar_query_xl):
+        """warm: pre-built ColumnarObj count — pure column scan, GIL-free."""
+        benchmark.group = "columnar count N=1M"
+        t = self._THRESHOLD
+        result = benchmark(
+            lambda: columnar_query_xl.filter(field("latency_ms") > t).count()
+        )
+        assert result >= 0

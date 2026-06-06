@@ -1,3 +1,4 @@
+use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
@@ -103,16 +104,27 @@ impl PyFieldExpr {
     }
 
     /// Evaluate this field expression against a Python dict.
-    /// Enables FieldExpr to be used anywhere a Python callable is expected
-    /// (e.g. `.any(field("x") > 5)` on an Obj pipeline).
-    fn __call__(&self, row: &Bound<'_, PyAny>) -> PyResult<bool> {
+    /// - bare `field("x")`: extracts and returns the value at key "x"
+    /// - `field("x") > 5`: returns bool (filter predicate)
+    fn __call__(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         let Some(op) = &self.op else {
-            return Ok(true);
+            // bare field access — extract value, not a filter predicate
+            let dict = row.downcast::<PyDict>().map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "FieldExpr('{}'): expected dict, got {}",
+                    self.name,
+                    row.get_type().name().unwrap_or_default()
+                ))
+            })?;
+            return dict
+                .get_item(self.name.as_ref())?
+                .map(|v| v.unbind())
+                .ok_or_else(|| PyKeyError::new_err(self.name.to_string()));
         };
         if let Ok(dict) = row.downcast::<PyDict>() {
-            obj_op_passes_py_dict(dict, op)
+            Ok(py_dict_satisfies_obj_predicate(dict, op)?.into_py(py))
         } else {
-            Ok(false)
+            Ok(false.into_py(py))
         }
     }
 }
@@ -418,9 +430,9 @@ pub(crate) fn py_to_rust_value(obj: &Bound<'_, PyAny>) -> PyResult<RustValue> {
 
 /// Check an ObjOp against a Python dict without converting to a full RustRow.
 /// Accesses only the field referenced by the op, so it's O(1) per element.
-fn obj_op_passes_py_dict(dict: &Bound<'_, PyDict>, op: &ObjOp) -> PyResult<bool> {
+fn py_dict_satisfies_obj_predicate(dict: &Bound<'_, PyDict>, op: &ObjOp) -> PyResult<bool> {
     #[inline]
-    fn get_f64(dict: &Bound<'_, PyDict>, field: &str) -> f64 {
+    fn extract_f64_from_dict(dict: &Bound<'_, PyDict>, field: &str) -> f64 {
         match dict.get_item(field) {
             Ok(Some(v)) => v
                 .extract::<f64>()
@@ -431,12 +443,12 @@ fn obj_op_passes_py_dict(dict: &Bound<'_, PyDict>, op: &ObjOp) -> PyResult<bool>
         }
     }
     match op {
-        ObjOp::FilterFieldGt(f, t) => Ok(get_f64(dict, f) > *t),
-        ObjOp::FilterFieldGe(f, t) => Ok(get_f64(dict, f) >= *t),
-        ObjOp::FilterFieldLt(f, t) => Ok(get_f64(dict, f) < *t),
-        ObjOp::FilterFieldLe(f, t) => Ok(get_f64(dict, f) <= *t),
+        ObjOp::FilterFieldGt(f, t) => Ok(extract_f64_from_dict(dict, f) > *t),
+        ObjOp::FilterFieldGe(f, t) => Ok(extract_f64_from_dict(dict, f) >= *t),
+        ObjOp::FilterFieldLt(f, t) => Ok(extract_f64_from_dict(dict, f) < *t),
+        ObjOp::FilterFieldLe(f, t) => Ok(extract_f64_from_dict(dict, f) <= *t),
         ObjOp::FilterFieldBetween(f, lo, hi) => {
-            let v = get_f64(dict, f);
+            let v = extract_f64_from_dict(dict, f);
             Ok(v >= *lo && v <= *hi)
         }
         ObjOp::FilterFieldEq(f, target) => {

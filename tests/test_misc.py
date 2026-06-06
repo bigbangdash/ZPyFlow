@@ -4,6 +4,7 @@ import pytest
 
 try:
     from zpyflow import Query, col, field, AggSpec, agg_count, agg_sum, agg_mean, agg_max, agg_min
+    from zpyflow._zpyflow import _infer_schema, _convert_to_columnar
     HAS_EXTENSION = True
 except ImportError:
     HAS_EXTENSION = False
@@ -334,3 +335,383 @@ class TestConvenienceMethods:
 
     def test_product_with_zero(self):
         assert Query([1, 2, 0, 3]).product() == 0
+
+
+class TestFind:
+    """Query.find(pred) — first matching element, short-circuits."""
+
+    def test_find_returns_first_match(self):
+        records = [{"id": 1}, {"id": 2}, {"id": 3}]
+        assert Query(records).find(lambda r: r["id"] == 2) == {"id": 2}
+
+    def test_find_returns_none_when_no_match(self):
+        assert Query([1, 2, 3]).find(lambda x: x > 10) is None
+
+    def test_find_empty(self):
+        assert Query([]).find(lambda x: x > 0) is None
+
+    def test_find_returns_first_not_last(self):
+        records = [{"v": 5}, {"v": 5}, {"v": 7}]
+        result = Query(records).find(lambda r: r["v"] == 5)
+        assert result is records[0]
+
+    def test_find_short_circuits(self):
+        seen = []
+        Query([1, 2, 3, 4, 5]).find(lambda x: (seen.append(x), x == 3)[1])
+        assert seen == [1, 2, 3]  # stops after finding 3
+
+    def test_find_scalars(self):
+        assert Query([10, 20, 30]).find(lambda x: x > 15) == 20
+
+    def test_find_with_field_expr(self):
+        records = [{"status": "ok"}, {"status": "error"}, {"status": "ok"}]
+        result = Query(records).find(field("status") == "error")
+        assert result == {"status": "error"}
+
+    def test_find_first_element(self):
+        assert Query([1, 2, 3]).find(lambda x: True) == 1
+
+    def test_find_last_element_only(self):
+        assert Query([1, 2, 3]).find(lambda x: x == 3) == 3
+
+
+class TestAggregationShorthands:
+    """count_if / sum_by / mean_by — single-pass aggregation shorthands."""
+
+    # count_if
+    def test_count_if_basic(self):
+        records = [{"status": "ok"}, {"status": "error"}, {"status": "ok"}]
+        assert Query(records).count_if(lambda r: r["status"] == "error") == 1
+
+    def test_count_if_none_match(self):
+        assert Query([1, 2, 3]).count_if(lambda x: x > 10) == 0
+
+    def test_count_if_all_match(self):
+        assert Query([1, 2, 3]).count_if(lambda x: x > 0) == 3
+
+    def test_count_if_empty(self):
+        assert Query([]).count_if(lambda x: True) == 0
+
+    def test_count_if_field_expr(self):
+        records = [{"active": True}, {"active": False}, {"active": True}]
+        assert Query(records).count_if(field("active") == True) == 2
+
+    def test_count_if_returns_int(self):
+        result = Query([1, 2, 3]).count_if(lambda x: x > 1)
+        assert isinstance(result, int) and result == 2
+
+    # sum_by
+    def test_sum_by_basic(self):
+        records = [{"price": 10}, {"price": 20}, {"price": 30}]
+        assert Query(records).sum_by(lambda r: r["price"]) == 60.0
+
+    def test_sum_by_empty(self):
+        assert Query([]).sum_by(lambda r: r["v"]) == 0.0
+
+    def test_sum_by_floats(self):
+        records = [{"v": 1.5}, {"v": 2.5}]
+        assert Query(records).sum_by(lambda r: r["v"]) == 4.0
+
+    def test_sum_by_field_expr(self):
+        records = [{"score": 3}, {"score": 7}]
+        assert Query(records).sum_by(field("score")) == 10.0
+
+    def test_sum_by_scalars(self):
+        assert Query([1, 2, 3, 4]).sum_by(lambda x: x * 2) == 20.0
+
+    # mean_by
+    def test_mean_by_basic(self):
+        records = [{"score": 80}, {"score": 90}, {"score": 100}]
+        assert Query(records).mean_by(lambda r: r["score"]) == 90.0
+
+    def test_mean_by_empty_returns_none(self):
+        assert Query([]).mean_by(lambda r: r["v"]) is None
+
+    def test_mean_by_single(self):
+        assert Query([{"v": 42}]).mean_by(lambda r: r["v"]) == 42.0
+
+    def test_mean_by_floats(self):
+        records = [{"v": 1.0}, {"v": 2.0}, {"v": 3.0}]
+        assert Query(records).mean_by(lambda r: r["v"]) == 2.0
+
+    def test_mean_by_field_expr(self):
+        records = [{"rating": 4}, {"rating": 5}]
+        assert Query(records).mean_by(field("rating")) == 4.5
+
+
+class TestInferSchema:
+    """_infer_schema — spec-082 T1: dtype inference from list-of-dicts sample."""
+
+    def test_all_float(self):
+        data = [{"score": 0.9}, {"score": 0.1}, {"score": 0.5}]
+        schema = _infer_schema(data)
+        assert schema["score"] == "f64"
+
+    def test_all_int(self):
+        data = [{"count": 1}, {"count": 2}, {"count": 3}]
+        schema = _infer_schema(data)
+        assert schema["count"] == "i64"
+
+    def test_int_and_float_upgrades_to_f64(self):
+        data = [{"x": 1}, {"x": 2.0}, {"x": 3}]
+        schema = _infer_schema(data)
+        assert schema["x"] == "f64"
+
+    def test_all_str(self):
+        data = [{"name": "alice"}, {"name": "bob"}]
+        schema = _infer_schema(data)
+        assert schema["name"] == "str"
+
+    def test_none_value_keeps_numeric_dtype(self):
+        # None is treated as nullable-of-the-inferred-type, not Mixed.
+        # The null is recorded in the nulls bitvec; the schema stays F64.
+        data = [{"v": 1.0}, {"v": None}, {"v": 3.0}]
+        schema = _infer_schema(data)
+        assert schema["v"] == "f64"
+
+    def test_all_none_gives_mixed(self):
+        # If the first sampled row has None, type cannot be inferred → Mixed.
+        data = [{"v": None}, {"v": 1.0}]
+        schema = _infer_schema(data)
+        assert schema["v"] == "mixed"
+
+    def test_missing_field_gives_mixed(self):
+        data = [{"a": 1, "b": 2}, {"a": 3}]
+        schema = _infer_schema(data)
+        assert schema["a"] == "i64"
+        assert schema["b"] == "mixed"
+
+    def test_mixed_types_str_and_int(self):
+        data = [{"v": "hello"}, {"v": 42}]
+        schema = _infer_schema(data)
+        assert schema["v"] == "mixed"
+
+    def test_empty_list(self):
+        assert _infer_schema([]) == {}
+
+    def test_multi_field(self):
+        data = [{"score": 0.9, "label": "ok", "count": 5},
+                {"score": 0.2, "label": "bad", "count": 3}]
+        schema = _infer_schema(data)
+        assert schema["score"] == "f64"
+        assert schema["label"] == "str"
+        assert schema["count"] == "i64"
+
+    def test_sample_size_limits_rows(self):
+        # Only first 2 rows sampled; row 3 has None but is ignored.
+        data = [{"v": 1.0}, {"v": 2.0}, {"v": None}]
+        schema = _infer_schema(data, sample_size=2)
+        assert schema["v"] == "f64"
+
+    def test_bool_treated_as_i64(self):
+        data = [{"flag": True}, {"flag": False}]
+        schema = _infer_schema(data)
+        assert schema["flag"] == "i64"
+
+
+class TestConvertToColumnar:
+    """_convert_to_columnar — spec-082 T2: dict list → typed column vectors."""
+
+    def test_f64_column(self):
+        data = [{"score": 0.9}, {"score": 0.2}, {"score": 0.5}]
+        cols = _convert_to_columnar(data)
+        assert cols["score"]["dtype"] == "f64"
+        assert cols["score"]["data"] == [0.9, 0.2, 0.5]
+        assert cols["score"]["nulls"] == [False, False, False]
+
+    def test_i64_column(self):
+        data = [{"n": 1}, {"n": 2}, {"n": 3}]
+        cols = _convert_to_columnar(data)
+        assert cols["n"]["dtype"] == "i64"
+        assert cols["n"]["data"] == [1, 2, 3]
+
+    def test_str_column(self):
+        data = [{"name": "alice"}, {"name": "bob"}]
+        cols = _convert_to_columnar(data)
+        assert cols["name"]["dtype"] == "str"
+        assert cols["name"]["data"] == ["alice", "bob"]
+
+    def test_none_fills_nan_and_marks_null(self):
+        import math
+        data = [{"v": 1.0}, {"v": None}, {"v": 3.0}]
+        cols = _convert_to_columnar(data)
+        assert cols["v"]["nulls"] == [False, True, False]
+        assert math.isnan(cols["v"]["data"][1])
+
+    def test_missing_field_fills_default_and_marks_null(self):
+        data = [{"a": 1, "b": 2}, {"a": 3}]
+        cols = _convert_to_columnar(data)
+        assert cols["b"]["nulls"] == [False, True]
+
+    def test_mixed_column_stores_python_objects(self):
+        data = [{"v": "hello"}, {"v": 42}]
+        cols = _convert_to_columnar(data)
+        assert cols["v"]["dtype"] == "mixed"
+        assert cols["v"]["data"] == ["hello", 42]
+
+    def test_multi_field(self):
+        data = [
+            {"score": 0.9, "label": "ok",  "count": 5},
+            {"score": 0.2, "label": "bad", "count": 3},
+        ]
+        cols = _convert_to_columnar(data)
+        assert cols["score"]["dtype"] == "f64"
+        assert cols["label"]["dtype"] == "str"
+        assert cols["count"]["dtype"] == "i64"
+
+    def test_empty_list(self):
+        cols = _convert_to_columnar([])
+        assert cols == {}
+
+    def test_int_in_f64_column_converts(self):
+        # int mixed with float → schema infers f64; ints should become floats
+        data = [{"x": 1}, {"x": 2.5}, {"x": 3}]
+        cols = _convert_to_columnar(data)
+        assert cols["x"]["dtype"] == "f64"
+        assert cols["x"]["data"] == [1.0, 2.5, 3.0]
+
+
+class TestColumnarObj:
+    """spec-082 T3 — ColumnarObj filter hot path via .preload()."""
+
+    LOGS = [
+        {"score": 0.9, "status": "ok",  "count": 10},
+        {"score": 0.3, "status": "bad", "count": 5},
+        {"score": 0.7, "status": "ok",  "count": 8},
+        {"score": 0.1, "status": "bad", "count": 2},
+        {"score": 0.5, "status": "ok",  "count": 3},
+    ]
+
+    def test_preload_returns_columnar_repr(self):
+        q = Query(self.LOGS).preload()
+        assert "columnar_obj" in repr(q)
+
+    def test_filter_gt_matches_python(self):
+        logs = self.LOGS
+        expected = [r for r in logs if r["score"] > 0.5]
+        result = Query(logs).preload().filter(field("score") > 0.5).to_list()
+        assert sorted(result, key=lambda r: r["score"]) == sorted(expected, key=lambda r: r["score"])
+
+    def test_filter_lt(self):
+        logs = self.LOGS
+        expected = [r for r in logs if r["score"] < 0.5]
+        result = Query(logs).preload().filter(field("score") < 0.5).to_list()
+        assert len(result) == len(expected)
+
+    def test_filter_eq_str(self):
+        logs = self.LOGS
+        expected = [r for r in logs if r["status"] == "ok"]
+        result = Query(logs).preload().filter(field("status") == "ok").to_list()
+        assert len(result) == len(expected)
+
+    def test_filter_ne_str(self):
+        logs = self.LOGS
+        expected = [r for r in logs if r["status"] != "ok"]
+        result = Query(logs).preload().filter(field("status") != "ok").to_list()
+        assert len(result) == len(expected)
+
+    def test_count_matches_python(self):
+        logs = self.LOGS
+        expected = sum(1 for r in logs if r["score"] > 0.4)
+        assert Query(logs).preload().filter(field("score") > 0.4).count() == expected
+
+    def test_chained_filters(self):
+        logs = self.LOGS
+        expected = [r for r in logs if r["score"] > 0.4 and r["count"] >= 8]
+        result = (
+            Query(logs)
+            .preload()
+            .filter(field("score") > 0.4)
+            .filter(field("count") >= 8)
+            .to_list()
+        )
+        assert len(result) == len(expected)
+
+    def test_explain_shows_columnar(self):
+        q = Query(self.LOGS).preload()
+        expl = q.filter(field("score") > 0.5).explain()
+        assert "columnar_obj" in expl
+
+    def test_empty_result(self):
+        result = Query(self.LOGS).preload().filter(field("score") > 99.0).to_list()
+        assert result == []
+
+    def test_all_rows_pass(self):
+        result = Query(self.LOGS).preload().filter(field("score") > 0.0).to_list()
+        assert len(result) == len(self.LOGS)
+
+    def test_null_field_excluded_from_numeric_filter(self):
+        data = [{"score": 1.0}, {"score": None}, {"score": 0.5}]
+        result = Query(data).preload().filter(field("score") > 0.3).to_list()
+        assert len(result) == 2  # None row excluded
+
+    def test_str_startswith(self):
+        logs = self.LOGS
+        result = Query(logs).preload().filter(field("status").startswith("ok")).to_list()
+        expected = [r for r in logs if r["status"].startswith("ok")]
+        assert len(result) == len(expected)
+
+    def test_str_contains(self):
+        logs = self.LOGS
+        result = Query(logs).preload().filter(field("status").contains("a")).to_list()
+        expected = [r for r in logs if "a" in r["status"]]
+        assert len(result) == len(expected)
+
+
+class TestColumnarObjArrow:
+    """spec-083 T2 — to_arrow() / to_polars() / to_pandas() for ColumnarObj."""
+
+    pytest.importorskip("pyarrow", reason="pyarrow not installed")
+
+    LOGS = [
+        {"score": 0.9, "label": "ok",  "count": 10},
+        {"score": 0.3, "label": "bad", "count": 5},
+        {"score": 0.7, "label": "ok",  "count": 8},
+        {"score": 0.1, "label": "bad", "count": 2},
+    ]
+
+    def test_to_arrow_returns_record_batch(self):
+        pa = pytest.importorskip("pyarrow")
+        rb = Query(self.LOGS).preload().to_arrow()
+        assert isinstance(rb, pa.RecordBatch)
+        assert rb.num_rows == len(self.LOGS)
+
+    def test_to_arrow_column_types(self):
+        pa = pytest.importorskip("pyarrow")
+        rb = Query(self.LOGS).preload().to_arrow()
+        assert rb.schema.field("score").type == pa.float64()
+        assert rb.schema.field("count").type == pa.int64()
+
+    def test_to_arrow_filtered(self):
+        pa = pytest.importorskip("pyarrow")
+        rb = Query(self.LOGS).preload().filter(field("score") > 0.5).to_arrow()
+        assert rb.num_rows == 2
+        scores = rb.column("score").to_pylist()
+        assert all(s > 0.5 for s in scores)
+
+    def test_to_arrow_nullable_column(self):
+        pa = pytest.importorskip("pyarrow")
+        data = [{"x": 1.0}, {"x": None}, {"x": 3.0}]
+        rb = Query(data).preload().to_arrow()
+        vals = rb.column("x").to_pylist()
+        assert vals[0] == 1.0
+        assert vals[1] is None
+        assert vals[2] == 3.0
+
+    def test_to_arrow_empty(self):
+        pa = pytest.importorskip("pyarrow")
+        rb = Query(self.LOGS).preload().filter(field("score") > 99.0).to_arrow()
+        assert rb.num_rows == 0
+
+    def test_to_polars_returns_dataframe(self):
+        pl = pytest.importorskip("polars")
+        pytest.importorskip("pyarrow")
+        df = Query(self.LOGS).preload().filter(field("score") > 0.5).to_polars()
+        assert hasattr(df, "shape")
+        assert df.shape[0] == 2
+
+    def test_to_pandas_returns_dataframe(self):
+        pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        df = Query(self.LOGS).preload().filter(field("score") > 0.5).to_pandas()
+        assert len(df) == 2

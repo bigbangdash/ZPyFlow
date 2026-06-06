@@ -22,7 +22,7 @@ use wide::{f32x8, f64x4, i64x4, CmpEq, CmpGe, CmpGt, CmpLe, CmpLt};
 // ---------------------------------------------------------------------------
 
 /// Execute a sequence of numeric ops using SIMD where possible.
-/// Caller guarantees that `can_use_simd_path` returned true for `ops`.
+/// Caller guarantees that `pipeline_is_simd_eligible` returned true for `ops`.
 pub fn execute_simd_pipeline(data: &[f64], ops: &[NumericOp]) -> Vec<f64> {
     if ops.is_empty() {
         return data.to_vec();
@@ -44,22 +44,22 @@ pub fn execute_simd_pipeline(data: &[f64], ops: &[NumericOp]) -> Vec<f64> {
     let Some(fi) = first_filter else {
         // Pure map chain — one copy, applied in-place.
         let mut result = data.to_vec();
-        flush_maps(&mut result, &collect_map_ops(ops));
+        apply_pending_map_ops(&mut result, &extract_consecutive_map_ops(ops));
         return result;
     };
 
     // Check whether any map op precedes the first filter.
-    let has_leading_maps = ops[..fi].iter().any(|op| to_map_op(op).is_some());
+    let has_leading_maps = ops[..fi].iter().any(|op| try_into_map_op(op).is_some());
 
     // Build the initial filtered result.
     // Filter-first: filter directly from the input slice — no upfront full copy.
     // This halves allocations (1 instead of 2) for the common filter-only case.
     let mut result = if has_leading_maps {
         let mut r = data.to_vec();
-        flush_maps(&mut r, &collect_map_ops(&ops[..fi]));
-        apply_filter_op(&r, &ops[fi])
+        apply_pending_map_ops(&mut r, &extract_consecutive_map_ops(&ops[..fi]));
+        apply_simd_filter_op(&r, &ops[fi])
     } else {
-        apply_filter_op(data, &ops[fi])
+        apply_simd_filter_op(data, &ops[fi])
     };
 
     // Apply remaining ops on the now-smaller result.
@@ -71,24 +71,24 @@ pub fn execute_simd_pipeline(data: &[f64], ops: &[NumericOp]) -> Vec<f64> {
             | NumericOp::FilterLt(_)
             | NumericOp::FilterLe(_)
             | NumericOp::FilterBetween(_, _) => {
-                flush_maps(&mut result, &pending_maps);
+                apply_pending_map_ops(&mut result, &pending_maps);
                 pending_maps.clear();
-                result = apply_filter_op(&result, op);
+                result = apply_simd_filter_op(&result, op);
             }
             _ => {
-                if let Some(m) = to_map_op(op) {
+                if let Some(m) = try_into_map_op(op) {
                     pending_maps.push(m);
                 }
             }
         }
     }
     if !pending_maps.is_empty() {
-        flush_maps(&mut result, &pending_maps);
+        apply_pending_map_ops(&mut result, &pending_maps);
     }
     result
 }
 
-fn apply_filter_op(data: &[f64], op: &NumericOp) -> Vec<f64> {
+fn apply_simd_filter_op(data: &[f64], op: &NumericOp) -> Vec<f64> {
     match op {
         NumericOp::FilterGt(t) => simd_filter_gt(data, *t),
         NumericOp::FilterGe(t) => simd_filter_ge(data, *t),
@@ -99,11 +99,11 @@ fn apply_filter_op(data: &[f64], op: &NumericOp) -> Vec<f64> {
     }
 }
 
-fn collect_map_ops(ops: &[NumericOp]) -> Vec<MapOp> {
-    ops.iter().filter_map(to_map_op).collect()
+fn extract_consecutive_map_ops(ops: &[NumericOp]) -> Vec<MapOp> {
+    ops.iter().filter_map(try_into_map_op).collect()
 }
 
-fn to_map_op(op: &NumericOp) -> Option<MapOp> {
+fn try_into_map_op(op: &NumericOp) -> Option<MapOp> {
     match op {
         NumericOp::MapMulScalar(s) => Some(MapOp::Mul(*s)),
         NumericOp::MapAddScalar(s) => Some(MapOp::Add(*s)),
@@ -157,7 +157,7 @@ enum MapOp {
 }
 
 /// Apply a batch of map operations in-place using SIMD.
-fn flush_maps(data: &mut Vec<f64>, maps: &[MapOp]) {
+fn apply_pending_map_ops(data: &mut Vec<f64>, maps: &[MapOp]) {
     for map in maps {
         match map {
             MapOp::Mul(s) => simd_map_mul_inplace(data, *s),
@@ -172,14 +172,14 @@ fn flush_maps(data: &mut Vec<f64>, maps: &[MapOp]) {
             MapOp::Round => simd_map_round_inplace(data),
             MapOp::Pow(s) => simd_map_pow_inplace(data, *s),
             MapOp::Reciprocal => simd_map_reciprocal_inplace(data),
-            MapOp::Log => { for v in data.iter_mut() { *v = v.ln(); } }
-            MapOp::Log2 => { for v in data.iter_mut() { *v = v.log2(); } }
-            MapOp::Log10 => { for v in data.iter_mut() { *v = v.log10(); } }
-            MapOp::Exp => { for v in data.iter_mut() { *v = v.exp(); } }
-            MapOp::Sigmoid => { for v in data.iter_mut() { *v = 1.0 / (1.0 + (-*v).exp()); } }
-            MapOp::Clamp(lo, hi) => { for v in data.iter_mut() { *v = v.clamp(*lo, *hi); } }
-            MapOp::Mod(s) => { for v in data.iter_mut() { *v %= s; } }
-            MapOp::FloorDiv(s) => { for v in data.iter_mut() { *v = (*v / s).floor(); } }
+            MapOp::Log => { for elem in data.iter_mut() { *elem = elem.ln(); } }
+            MapOp::Log2 => { for elem in data.iter_mut() { *elem = elem.log2(); } }
+            MapOp::Log10 => { for elem in data.iter_mut() { *elem = elem.log10(); } }
+            MapOp::Exp => { for elem in data.iter_mut() { *elem = elem.exp(); } }
+            MapOp::Sigmoid => { for elem in data.iter_mut() { *elem = 1.0 / (1.0 + (-*elem).exp()); } }
+            MapOp::Clamp(lo, hi) => { for elem in data.iter_mut() { *elem = elem.clamp(*lo, *hi); } }
+            MapOp::Mod(s) => { for elem in data.iter_mut() { *elem %= s; } }
+            MapOp::FloorDiv(s) => { for elem in data.iter_mut() { *elem = (*elem / s).floor(); } }
         }
     }
 }
@@ -202,15 +202,15 @@ pub fn simd_map_mul_inplace(data: &mut [f64], scalar: f64) {
     // SIMD path for full 4-wide chunks
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let result = v * scalar_v;
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let result = simd_vec * scalar_v;
         let arr: [f64; 4] = result.into();
         chunk.copy_from_slice(&arr);
     }
 
     // Scalar tail
-    for x in right.iter_mut() {
-        *x *= scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem *= scalar;
     }
 }
 
@@ -221,13 +221,13 @@ pub fn simd_map_add_inplace(data: &mut [f64], scalar: f64) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let result = v + scalar_v;
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let result = simd_vec + scalar_v;
         let arr: [f64; 4] = result.into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x += scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem += scalar;
     }
 }
 
@@ -238,13 +238,13 @@ pub fn simd_map_sub_inplace(data: &mut [f64], scalar: f64) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let result = v - scalar_v;
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let result = simd_vec - scalar_v;
         let arr: [f64; 4] = result.into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x -= scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem -= scalar;
     }
 }
 
@@ -261,13 +261,13 @@ pub fn simd_map_neg_inplace(data: &mut [f64]) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let result = v * neg_one;
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let result = simd_vec * neg_one;
         let arr: [f64; 4] = result.into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x = -*x;
+    for tail_elem in right.iter_mut() {
+        *tail_elem = -*tail_elem;
     }
 }
 
@@ -294,12 +294,12 @@ pub fn simd_map_floor_inplace(data: &mut [f64]) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let arr: [f64; 4] = v.floor().into();
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let arr: [f64; 4] = simd_vec.floor().into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x = x.floor();
+    for tail_elem in right.iter_mut() {
+        *tail_elem = tail_elem.floor();
     }
 }
 
@@ -308,12 +308,12 @@ pub fn simd_map_ceil_inplace(data: &mut [f64]) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let arr: [f64; 4] = v.ceil().into();
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let arr: [f64; 4] = simd_vec.ceil().into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x = x.ceil();
+    for tail_elem in right.iter_mut() {
+        *tail_elem = tail_elem.ceil();
     }
 }
 
@@ -338,12 +338,12 @@ pub fn simd_map_reciprocal_inplace(data: &mut [f64]) {
     let full = n / 4 * 4;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let arr: [f64; 4] = (one / v).into();
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let arr: [f64; 4] = (one / simd_vec).into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x = 1.0 / *x;
+    for tail_elem in right.iter_mut() {
+        *tail_elem = 1.0 / *tail_elem;
     }
 }
 
@@ -363,9 +363,9 @@ pub fn simd_filter_gt(data: &[f64], threshold: f64) -> Vec<f64> {
 
     let (left, right) = data.split_at(full);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
         // cmp_gt returns lanes with all bits set (NaN-safe in wide)
-        let mask = v.cmp_gt(threshold_v);
+        let mask = simd_vec.cmp_gt(threshold_v);
         let bits = mask.move_mask();
         // bits is a u8 where bit i means lane i passed
         if bits == 0b1111 {
@@ -400,8 +400,8 @@ pub fn simd_filter_ge(data: &[f64], threshold: f64) -> Vec<f64> {
     let (left, right) = data.split_at(full);
 
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(threshold_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(threshold_v);
         let bits = mask.move_mask();
         if bits == 0b1111 {
             out.extend_from_slice(chunk);
@@ -429,8 +429,8 @@ pub fn simd_filter_lt(data: &[f64], threshold: f64) -> Vec<f64> {
     let (left, right) = data.split_at(full);
 
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_lt(threshold_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_lt(threshold_v);
         let bits = mask.move_mask();
         if bits == 0b1111 {
             out.extend_from_slice(chunk);
@@ -458,8 +458,8 @@ pub fn simd_filter_le(data: &[f64], threshold: f64) -> Vec<f64> {
     let (left, right) = data.split_at(full);
 
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_le(threshold_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_le(threshold_v);
         let bits = mask.move_mask();
         if bits == 0b1111 {
             out.extend_from_slice(chunk);
@@ -490,8 +490,8 @@ pub fn simd_filter_between(data: &[f64], lo: f64, hi: f64) -> Vec<f64> {
     let (left, right) = data.split_at(full);
 
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
         let bits = mask.move_mask();
         if bits == 0b1111 {
             out.extend_from_slice(chunk);
@@ -523,10 +523,10 @@ pub fn simd_filter_gt_f32(data: &[f32], threshold: f32) -> Vec<f32> {
     let (left, right) = data.split_at(full);
 
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let mask = v.cmp_gt(threshold_v);
+        let mask = simd_vec.cmp_gt(threshold_v);
         let bits = mask.move_mask();
         if bits == 0xFF {
             out.extend_from_slice(chunk);
@@ -552,15 +552,15 @@ pub fn simd_map_mul_f32_inplace(data: &mut [f32], scalar: f32) {
     let full = n / 8 * 8;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let result = v * scalar_v;
+        let result = simd_vec * scalar_v;
         let arr: [f32; 8] = result.into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x *= scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem *= scalar;
     }
 }
 
@@ -571,10 +571,10 @@ pub fn simd_filter_ge_f32(data: &[f32], threshold: f32) -> Vec<f32> {
     let full = n / 8 * 8;
     let (left, right) = data.split_at(full);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let mask = v.cmp_ge(threshold_v);
+        let mask = simd_vec.cmp_ge(threshold_v);
         let bits = mask.move_mask();
         if bits == 0xFF {
             out.extend_from_slice(chunk);
@@ -601,10 +601,10 @@ pub fn simd_filter_lt_f32(data: &[f32], threshold: f32) -> Vec<f32> {
     let full = n / 8 * 8;
     let (left, right) = data.split_at(full);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let mask = v.cmp_lt(threshold_v);
+        let mask = simd_vec.cmp_lt(threshold_v);
         let bits = mask.move_mask();
         if bits == 0xFF {
             out.extend_from_slice(chunk);
@@ -631,10 +631,10 @@ pub fn simd_filter_le_f32(data: &[f32], threshold: f32) -> Vec<f32> {
     let full = n / 8 * 8;
     let (left, right) = data.split_at(full);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let mask = v.cmp_le(threshold_v);
+        let mask = simd_vec.cmp_le(threshold_v);
         let bits = mask.move_mask();
         if bits == 0xFF {
             out.extend_from_slice(chunk);
@@ -662,10 +662,10 @@ pub fn simd_filter_between_f32(data: &[f32], lo: f32, hi: f32) -> Vec<f32> {
     let full = n / 8 * 8;
     let (left, right) = data.split_at(full);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
         let bits = mask.move_mask();
         if bits == 0xFF {
             out.extend_from_slice(chunk);
@@ -691,14 +691,14 @@ pub fn simd_map_add_f32_inplace(data: &mut [f32], scalar: f32) {
     let full = n / 8 * 8;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let arr: [f32; 8] = (v + s).into();
+        let arr: [f32; 8] = (simd_vec + s).into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x += scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem += scalar;
     }
 }
 
@@ -708,14 +708,14 @@ pub fn simd_map_sub_f32_inplace(data: &mut [f32], scalar: f32) {
     let full = n / 8 * 8;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let arr: [f32; 8] = (v - s).into();
+        let arr: [f32; 8] = (simd_vec - s).into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x -= scalar;
+    for tail_elem in right.iter_mut() {
+        *tail_elem -= scalar;
     }
 }
 
@@ -725,14 +725,14 @@ pub fn simd_map_neg_f32_inplace(data: &mut [f32]) {
     let full = n / 8 * 8;
     let (left, right) = data.split_at_mut(full);
     for chunk in left.chunks_exact_mut(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        let arr: [f32; 8] = (v * neg_one).into();
+        let arr: [f32; 8] = (simd_vec * neg_one).into();
         chunk.copy_from_slice(&arr);
     }
-    for x in right.iter_mut() {
-        *x = -*x;
+    for tail_elem in right.iter_mut() {
+        *tail_elem = -*tail_elem;
     }
 }
 
@@ -758,10 +758,10 @@ pub fn simd_sum_f32(data: &[f32]) -> f32 {
     let (left, right) = data.split_at(full);
     let mut acc = f32x8::splat(0.0);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        acc += v;
+        acc += simd_vec;
     }
     let arr: [f32; 8] = acc.into();
     let mut total = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
@@ -789,10 +789,10 @@ pub fn simd_count_f32_gt(data: &[f32], threshold: f32) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 8 * 8);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        count += v.cmp_gt(thresh).move_mask().count_ones() as usize;
+        count += simd_vec.cmp_gt(thresh).move_mask().count_ones() as usize;
     }
     for &x in right {
         count += (x > threshold) as usize;
@@ -805,10 +805,10 @@ pub fn simd_count_f32_ge(data: &[f32], threshold: f32) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 8 * 8);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        count += v.cmp_ge(thresh).move_mask().count_ones() as usize;
+        count += simd_vec.cmp_ge(thresh).move_mask().count_ones() as usize;
     }
     for &x in right {
         count += (x >= threshold) as usize;
@@ -821,10 +821,10 @@ pub fn simd_count_f32_lt(data: &[f32], threshold: f32) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 8 * 8);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        count += v.cmp_lt(thresh).move_mask().count_ones() as usize;
+        count += simd_vec.cmp_lt(thresh).move_mask().count_ones() as usize;
     }
     for &x in right {
         count += (x < threshold) as usize;
@@ -837,10 +837,10 @@ pub fn simd_count_f32_le(data: &[f32], threshold: f32) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 8 * 8);
     for chunk in left.chunks_exact(8) {
-        let v = f32x8::from([
+        let simd_vec = f32x8::from([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        count += v.cmp_le(thresh).move_mask().count_ones() as usize;
+        count += simd_vec.cmp_le(thresh).move_mask().count_ones() as usize;
     }
     for &x in right {
         count += (x <= threshold) as usize;
@@ -949,8 +949,8 @@ pub fn simd_sum_f64(data: &[f64]) -> f64 {
 
     let mut acc = f64x4::splat(0.0);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        acc += v;
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        acc += simd_vec;
     }
 
     // Horizontal sum: add all 4 lanes
@@ -996,8 +996,8 @@ pub fn simd_max_f64(data: &[f64]) -> Option<f64> {
 
     let mut acc = f64x4::splat(f64::NEG_INFINITY);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        acc = acc.max(v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        acc = acc.max(simd_vec);
     }
 
     let arr: [f64; 4] = acc.into();
@@ -1021,8 +1021,8 @@ macro_rules! simd_count_fn {
             let mut count = 0usize;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                count += v.$cmp_method(thresh).move_mask().count_ones() as usize;
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                count += simd_vec.$cmp_method(thresh).move_mask().count_ones() as usize;
             }
             for &x in right {
                 count += (x $scalar_op threshold) as usize;
@@ -1043,8 +1043,8 @@ pub fn simd_count_between(data: &[f64], lo: f64, hi: f64) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
         count += mask.move_mask().count_ones() as usize;
     }
     for &x in right {
@@ -1064,9 +1064,9 @@ macro_rules! simd_filter_sum_fn {
             let mut acc = f64x4::ZERO;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 // blend(t, f): selects t where mask is all-1s, f where all-0s
-                acc += v.$cmp_method(thresh).blend(v, f64x4::ZERO);
+                acc += simd_vec.$cmp_method(thresh).blend(simd_vec, f64x4::ZERO);
             }
             let arr: [f64; 4] = acc.into();
             let mut sum = arr[0] + arr[1] + arr[2] + arr[3];
@@ -1089,9 +1089,9 @@ pub fn simd_filter_sum_between(data: &[f64], lo: f64, hi: f64) -> f64 {
     let mut acc = f64x4::ZERO;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
-        acc += mask.blend(v, f64x4::ZERO);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
+        acc += mask.blend(simd_vec, f64x4::ZERO);
     }
     let arr: [f64; 4] = acc.into();
     let mut sum = arr[0] + arr[1] + arr[2] + arr[3];
@@ -1116,9 +1116,9 @@ macro_rules! simd_filter_mean_fn {
             let mut cnt: usize = 0;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let mask = v.$cmp_method(thresh);
-                acc += mask.blend(v, f64x4::ZERO);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = simd_vec.$cmp_method(thresh);
+                acc += mask.blend(simd_vec, f64x4::ZERO);
                 cnt += mask.move_mask().count_ones() as usize;
             }
             let arr: [f64; 4] = acc.into();
@@ -1143,9 +1143,9 @@ pub fn simd_filter_mean_between(data: &[f64], lo: f64, hi: f64) -> Option<f64> {
     let mut cnt: usize = 0;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
-        acc += mask.blend(v, f64x4::ZERO);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
+        acc += mask.blend(simd_vec, f64x4::ZERO);
         cnt += mask.move_mask().count_ones() as usize;
     }
     let arr: [f64; 4] = acc.into();
@@ -1177,9 +1177,9 @@ macro_rules! simd_filter_var_fn {
             let mut cnt: usize = 0;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let mask = v.$cmp_method(thresh);
-                let f = mask.blend(v, f64x4::ZERO);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = simd_vec.$cmp_method(thresh);
+                let f = mask.blend(simd_vec, f64x4::ZERO);
                 sum_acc += f;
                 ssq_acc += f * f;
                 cnt += mask.move_mask().count_ones() as usize;
@@ -1212,9 +1212,9 @@ pub fn simd_filter_var_between(data: &[f64], lo: f64, hi: f64) -> Option<f64> {
     let mut cnt: usize = 0;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
-        let f = mask.blend(v, f64x4::ZERO);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
+        let f = mask.blend(simd_vec, f64x4::ZERO);
         sum_acc += f;
         ssq_acc += f * f;
         cnt += mask.move_mask().count_ones() as usize;
@@ -1250,12 +1250,12 @@ macro_rules! simd_filter_max_fn {
             let mut found = false;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let mask = v.$cmp_method(thresh);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = simd_vec.$cmp_method(thresh);
                 if mask.move_mask() != 0 {
                     found = true;
                     // Filtered lanes get NEG_INFINITY — neutral for max accumulation
-                    max_v = max_v.max(mask.blend(v, f64x4::splat(f64::NEG_INFINITY)));
+                    max_v = max_v.max(mask.blend(simd_vec, f64x4::splat(f64::NEG_INFINITY)));
                 }
             }
             let arr: [f64; 4] = max_v.into();
@@ -1285,12 +1285,12 @@ macro_rules! simd_filter_min_fn {
             let mut found = false;
             let (left, right) = data.split_at(data.len() / 4 * 4);
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let mask = v.$cmp_method(thresh);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = simd_vec.$cmp_method(thresh);
                 if mask.move_mask() != 0 {
                     found = true;
                     // Filtered lanes get INFINITY — neutral for min accumulation
-                    min_v = min_v.min(mask.blend(v, f64x4::splat(f64::INFINITY)));
+                    min_v = min_v.min(mask.blend(simd_vec, f64x4::splat(f64::INFINITY)));
                 }
             }
             let arr: [f64; 4] = min_v.into();
@@ -1323,14 +1323,14 @@ macro_rules! simd_filter_stats_fn {
             let (left, right) = data.split_at(data.len() / 4 * 4);
 
             for chunk in left.chunks_exact(4) {
-                let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let mask = v.$cmp_method(thresh);
+                let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let mask = simd_vec.$cmp_method(thresh);
                 let mask_bits = mask.move_mask();
                 if mask_bits != 0 {
                     count += mask_bits.count_ones() as usize;
-                    sum_v += mask.blend(v, f64x4::ZERO);
-                    min_v = min_v.min(mask.blend(v, f64x4::splat(f64::INFINITY)));
-                    max_v = max_v.max(mask.blend(v, f64x4::splat(f64::NEG_INFINITY)));
+                    sum_v += mask.blend(simd_vec, f64x4::ZERO);
+                    min_v = min_v.min(mask.blend(simd_vec, f64x4::splat(f64::INFINITY)));
+                    max_v = max_v.max(mask.blend(simd_vec, f64x4::splat(f64::NEG_INFINITY)));
                 }
             }
 
@@ -1374,14 +1374,14 @@ pub fn simd_filter_stats_between(data: &[f64], lo: f64, hi: f64) -> Option<(usiz
     let (left, right) = data.split_at(data.len() / 4 * 4);
 
     for chunk in left.chunks_exact(4) {
-        let v = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let mask = v.cmp_ge(lo_v) & v.cmp_le(hi_v);
+        let simd_vec = f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let mask = simd_vec.cmp_ge(lo_v) & simd_vec.cmp_le(hi_v);
         let mask_bits = mask.move_mask();
         if mask_bits != 0 {
             count += mask_bits.count_ones() as usize;
-            sum_v += mask.blend(v, f64x4::ZERO);
-            min_v = min_v.min(mask.blend(v, f64x4::splat(f64::INFINITY)));
-            max_v = max_v.max(mask.blend(v, f64x4::splat(f64::NEG_INFINITY)));
+            sum_v += mask.blend(simd_vec, f64x4::ZERO);
+            min_v = min_v.min(mask.blend(simd_vec, f64x4::splat(f64::INFINITY)));
+            max_v = max_v.max(mask.blend(simd_vec, f64x4::splat(f64::NEG_INFINITY)));
         }
     }
 
@@ -1439,8 +1439,8 @@ pub fn simd_count_i64_gt(data: &[i64], threshold: i64) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        count += count_mask_i64(v.cmp_gt(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        count += count_mask_i64(simd_vec.cmp_gt(thresh));
     }
     for &x in right {
         count += (x > threshold) as usize;
@@ -1453,8 +1453,8 @@ pub fn simd_count_i64_ge(data: &[i64], threshold: i64) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        count += count_mask_i64(v.cmp_gt(thresh) | v.cmp_eq(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        count += count_mask_i64(simd_vec.cmp_gt(thresh) | simd_vec.cmp_eq(thresh));
     }
     for &x in right {
         count += (x >= threshold) as usize;
@@ -1467,8 +1467,8 @@ pub fn simd_count_i64_lt(data: &[i64], threshold: i64) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        count += count_mask_i64(v.cmp_lt(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        count += count_mask_i64(simd_vec.cmp_lt(thresh));
     }
     for &x in right {
         count += (x < threshold) as usize;
@@ -1481,8 +1481,8 @@ pub fn simd_count_i64_le(data: &[i64], threshold: i64) -> usize {
     let mut count = 0usize;
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        count += count_mask_i64(v.cmp_lt(thresh) | v.cmp_eq(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        count += count_mask_i64(simd_vec.cmp_lt(thresh) | simd_vec.cmp_eq(thresh));
     }
     for &x in right {
         count += (x <= threshold) as usize;
@@ -1495,8 +1495,8 @@ pub fn simd_filter_i64_gt(data: &[i64], threshold: i64) -> Vec<i64> {
     let thresh = i64x4::splat(threshold);
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        push_masked_i64(&mut out, chunk, v.cmp_gt(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        push_masked_i64(&mut out, chunk, simd_vec.cmp_gt(thresh));
     }
     for &val in right {
         if val > threshold {
@@ -1511,8 +1511,8 @@ pub fn simd_filter_i64_ge(data: &[i64], threshold: i64) -> Vec<i64> {
     let thresh = i64x4::splat(threshold);
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        push_masked_i64(&mut out, chunk, v.cmp_gt(thresh) | v.cmp_eq(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        push_masked_i64(&mut out, chunk, simd_vec.cmp_gt(thresh) | simd_vec.cmp_eq(thresh));
     }
     for &val in right {
         if val >= threshold {
@@ -1527,8 +1527,8 @@ pub fn simd_filter_i64_lt(data: &[i64], threshold: i64) -> Vec<i64> {
     let thresh = i64x4::splat(threshold);
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        push_masked_i64(&mut out, chunk, v.cmp_lt(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        push_masked_i64(&mut out, chunk, simd_vec.cmp_lt(thresh));
     }
     for &val in right {
         if val < threshold {
@@ -1543,8 +1543,8 @@ pub fn simd_filter_i64_le(data: &[i64], threshold: i64) -> Vec<i64> {
     let thresh = i64x4::splat(threshold);
     let (left, right) = data.split_at(data.len() / 4 * 4);
     for chunk in left.chunks_exact(4) {
-        let v = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        push_masked_i64(&mut out, chunk, v.cmp_lt(thresh) | v.cmp_eq(thresh));
+        let simd_vec = i64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        push_masked_i64(&mut out, chunk, simd_vec.cmp_lt(thresh) | simd_vec.cmp_eq(thresh));
     }
     for &val in right {
         if val <= threshold {

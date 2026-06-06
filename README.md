@@ -6,8 +6,8 @@ Lazy query pipelines for Python, powered by Rust.
 
 ZPyFlow is for Python data that is already in memory: lists, NumPy arrays,
 generators, dict records, dataclasses, and similar objects. It runs lazy
-pipelines without building intermediate Python lists, and numeric DSL paths can
-run in Rust with the GIL released.
+pipelines without building intermediate Python lists, and numeric DSL paths
+execute in a SIMD-accelerated Rust kernel without constructing Python objects per element.
 
 - **Lazy and fused**: chained operations run in one pass.
 - **Numeric fast paths**: float/int/bool arrays execute in Rust.
@@ -177,6 +177,9 @@ Good fits:
 - You want a lazy pipeline API around ordinary Python data.
 - You can use `col` or `field()` instead of a Python callback.
 - You want Arrow or NumPy inputs to stay on a typed path.
+- You have a sync web endpoint (FastAPI, Flask) filtering or aggregating a large
+  numeric sequence — ZPyFlow's lower per-request CPU time translates directly to
+  higher RPS under concurrent load.
 
 Use another tool when:
 
@@ -225,6 +228,7 @@ See [site/docs/api.md](site/docs/api.md) for the complete API reference.
 - [Examples](site/docs/examples/index.md)
 - [Performance Guide](site/docs/performance.md)
 - [Benchmark Results](site/docs/benchmarks.md)
+- [When Is It Actually Fast?](docs/when_is_it_fast.md)
 - [Design Notes](site/docs/design.md)
 - [Architecture](ARCHITECTURE.md)
 - [Contributing](docs/contributing.md)

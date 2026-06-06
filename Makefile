@@ -15,12 +15,16 @@
 #
 # Docker Compose targets mirror the local targets with the dc- prefix.
 
+PYTHON ?= python3
+
 .DEFAULT_GOAL := help
 .PHONY: help build build-full build-debug test test-fast bench bench-rust lint fmt audit clean \
         docs docs-serve docs-deploy \
+        bench-threading bench-multiprocess bench-fastapi \
         dc-build dc-test dc-bench dc-bench-rust dc-shell dc-clean \
         dc-bench-filter dc-bench-chained dc-bench-numpy dc-bench-agg dc-bench-objects \
-        dc-bench-vector dc-bench-ml dc-bench-etl dc-bench-fraud dc-bench-groupby dc-bench-null
+        dc-bench-vector dc-bench-ml dc-bench-etl dc-bench-fraud dc-bench-groupby dc-bench-null \
+        dc-bench-threading dc-bench-multiprocess dc-bench-fastapi
 
 # ── Colour output ─────────────────────────────────────────────────────────────
 CYAN  := \033[36m
@@ -49,22 +53,22 @@ test-fast: build  ## Run tests without verbose output (thin-LTO build)
 	pytest tests/ -q
 
 bench: build-full  ## Run all Python benchmark suites (fat-LTO build for accurate numbers)
-	python sandbox/benchmark/run.py --suite all
+	$(PYTHON) sandbox/benchmark/run.py --suite all
 
 bench-filter: build-full  ## Run filter benchmarks
-	python sandbox/benchmark/run.py --suite filter
+	$(PYTHON) sandbox/benchmark/run.py --suite filter
 
 bench-chained: build-full  ## Run chained pipeline benchmarks
-	python sandbox/benchmark/run.py --suite chained
+	$(PYTHON) sandbox/benchmark/run.py --suite chained
 
 bench-numpy: build-full  ## Run numpy comparison benchmarks
-	python sandbox/benchmark/run.py --suite vs_numpy
+	$(PYTHON) sandbox/benchmark/run.py --suite vs_numpy
 
 bench-agg: build-full  ## Run aggregation benchmarks
-	python sandbox/benchmark/run.py --suite aggregation
+	$(PYTHON) sandbox/benchmark/run.py --suite aggregation
 
 bench-objects: build-full  ## Run Python object benchmarks
-	python sandbox/benchmark/run.py --suite objects
+	$(PYTHON) sandbox/benchmark/run.py --suite objects
 
 bench-rust:  ## Run Criterion (Rust) benchmarks
 	cargo bench --bench pipeline
@@ -72,11 +76,20 @@ bench-rust:  ## Run Criterion (Rust) benchmarks
 bench-rust-simd:  ## Run SIMD selectivity benchmarks
 	cargo bench --bench simd_filter
 
+bench-threading:  ## GIL release effect: Python vs ZPyFlow under N concurrent threads
+	$(PYTHON) sandbox/benchmark/bench_threading.py
+
+bench-multiprocess:  ## Process-level scaling: Python vs ZPyFlow with ProcessPoolExecutor
+	$(PYTHON) sandbox/benchmark/bench_multiprocess.py
+
+bench-fastapi:  ## FastAPI sync endpoint RPS: Python vs ZPyFlow (requires fastapi uvicorn httpx)
+	$(PYTHON) sandbox/benchmark/bench_fastapi.py
+
 bench-save: build-full  ## Save current results as baseline
-	SUITE=$${SUITE:-filter} python sandbox/benchmark/run.py --suite $${SUITE} --save
+	SUITE=$${SUITE:-filter} $(PYTHON) sandbox/benchmark/run.py --suite $${SUITE} --save
 
 bench-compare: build-full  ## Compare against saved baseline (fails if >10% regression)
-	SUITE=$${SUITE:-filter} python sandbox/benchmark/run.py --suite $${SUITE} --compare
+	SUITE=$${SUITE:-filter} $(PYTHON) sandbox/benchmark/run.py --suite $${SUITE} --compare
 
 lint:  ## Run Rust linter
 	cargo clippy -- -D warnings
@@ -150,6 +163,15 @@ dc-bench-groupby:  ## [Docker] Run GroupBy and pagination benchmarks
 
 dc-bench-null:  ## [Docker] Run null-mixed list benchmarks
 	SUITE=null docker compose run --rm bench-suite
+
+dc-bench-threading:  ## [Docker] GIL release effect under N concurrent threads
+	docker compose run --rm bench-threading
+
+dc-bench-multiprocess:  ## [Docker] Process-level scaling with ProcessPoolExecutor
+	docker compose run --rm bench-multiprocess
+
+dc-bench-fastapi:  ## [Docker] FastAPI sync endpoint RPS comparison
+	docker compose run --rm bench-fastapi
 
 dc-bench-rust:  ## [Docker] Run Criterion benchmarks
 	docker compose run --rm bench-rust

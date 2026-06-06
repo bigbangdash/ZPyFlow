@@ -20,7 +20,7 @@ from models import skewed_float_list, SIZES
 
 try:
     from zpyflow import Query, col
-    from zpyflow import from_numpy as zpf_from_numpy
+    from zpyflow import from_numpy as zpyflow_from_numpy
     HAS_ZPYFLOW = True
 except ImportError:
     HAS_ZPYFLOW = False
@@ -72,7 +72,7 @@ class TestFlagCount:
     def test_zpyflow_from_numpy(self, benchmark, arr_xl):
         """Input: numpy array — buffer protocol path, competitive with numpy."""
         benchmark.group = "fraud flag count N=1M"
-        result = benchmark(lambda: zpf_from_numpy(arr_xl).filter(col > THRESHOLD_MODERATE).count())
+        result = benchmark(lambda: zpyflow_from_numpy(arr_xl).filter(col > THRESHOLD_MODERATE).count())
         assert result >= 0
 
 
@@ -189,5 +189,5 @@ class TestBoolFlagCount:
     def test_zpyflow_from_numpy(self, benchmark, bool_arr_xl):
         """ZPyFlow from_numpy: bool → compact uint8 buffer, fused count."""
         benchmark.group = "bool flag count N=1M"
-        result = benchmark(lambda: zpf_from_numpy(bool_arr_xl).filter(col > 0).count())
+        result = benchmark(lambda: zpyflow_from_numpy(bool_arr_xl).filter(col > 0).count())
         assert result >= 0

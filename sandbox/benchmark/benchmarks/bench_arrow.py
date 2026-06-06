@@ -1,9 +1,10 @@
-# bench_arrow.py — from_arrow() fast paths vs to_pylist() fallback
+# bench_arrow.py — from_arrow() fast paths, to_pylist() fallback, output format comparison
 #
 # Benchmarks:
 #   - float64 null-free: buffer protocol fast path
-#   - float64 with nulls: NaN fast path (new)
+#   - float64 with nulls: NaN fast path
 #   - float64 via to_pylist(): baseline
+#   - output formats: to_list / to_arrow / to_polars / to_pandas (spec-083 T6)
 #
 # Run:
 #   pytest sandbox/benchmark/benchmarks/bench_arrow.py -v --benchmark-columns=mean,ops
@@ -18,10 +19,22 @@ except ImportError:
     HAS_ARROW = False
 
 try:
-    from zpyflow import from_arrow, col
+    from zpyflow import from_arrow, Query, col
     HAS_ZPYFLOW = True
 except ImportError:
     HAS_ZPYFLOW = False
+
+try:
+    import polars as pl
+    HAS_POLARS = True
+except ImportError:
+    HAS_POLARS = False
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 
 pytestmark = [
     pytest.mark.skipif(not HAS_ZPYFLOW, reason="zpyflow not built"),
@@ -29,6 +42,12 @@ pytestmark = [
 ]
 
 N = 1_000_000
+
+
+@pytest.fixture(scope="module")
+def lst_f64():
+    rng = np.random.default_rng(0)
+    return rng.standard_normal(N).tolist()
 
 
 @pytest.fixture(scope="module")
@@ -122,3 +141,48 @@ class TestArrowI64:
             return sum(1 for x in lst if x > 500_000)
         result = benchmark(run)
         assert result > 0
+
+
+# ---------------------------------------------------------------------------
+# spec-083 T6 — output format overhead: to_list vs to_arrow vs to_polars vs to_pandas
+# ---------------------------------------------------------------------------
+
+class TestOutputFormats:
+    """Compare output format cost for a filter pipeline (N=1M f64).
+
+    All variants run the same filter (col > 0) on the same list input.
+    Goal: to_arrow() overhead ≤ 2× to_list() (spec-083 target).
+    """
+
+    def test_to_list(self, benchmark, lst_f64):
+        benchmark.group = "output format N=1M"
+        result = benchmark(lambda: Query(lst_f64).filter(col > 0).to_list())
+        assert len(result) > 0
+
+    def test_to_bytes_frombuffer(self, benchmark, lst_f64):
+        """Raw-byte path (f64 only): fastest ndarray output."""
+        benchmark.group = "output format N=1M"
+        result = benchmark(
+            lambda: np.frombuffer(Query(lst_f64).filter(col > 0).to_bytes()).copy()
+        )
+        assert len(result) > 0
+
+    def test_to_arrow(self, benchmark, lst_f64):
+        """to_arrow(): buffer protocol, zero-copy for f64 path."""
+        benchmark.group = "output format N=1M"
+        result = benchmark(lambda: Query(lst_f64).filter(col > 0).to_arrow())
+        assert len(result) > 0
+
+    @pytest.mark.skipif(not HAS_POLARS, reason="polars not installed")
+    def test_to_polars(self, benchmark, lst_f64):
+        """to_polars(): to_arrow() → polars.from_arrow()."""
+        benchmark.group = "output format N=1M"
+        result = benchmark(lambda: Query(lst_f64).filter(col > 0).to_polars())
+        assert len(result) > 0
+
+    @pytest.mark.skipif(not HAS_PANDAS, reason="pandas not installed")
+    def test_to_pandas(self, benchmark, lst_f64):
+        """to_pandas(): to_arrow() → pyarrow ChunkedArray.to_pandas()."""
+        benchmark.group = "output format N=1M"
+        result = benchmark(lambda: Query(lst_f64).filter(col > 0).to_pandas())
+        assert len(result) > 0

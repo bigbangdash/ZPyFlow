@@ -4,8 +4,8 @@ use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
 use crate::core::{
-    count_fused_f32_bounded, count_fused_f64_bounded, eval_filter_f64, execute_fused_f32_bounded,
-    execute_fused_f64_bounded, filter_mean_fused_f64, filter_multi_stat_f64, filter_sum_fused_f64,
+    count_fused_f32_with_skip_take, count_fused_f64_with_skip_take, eval_filter_f64, execute_fused_f32_with_skip_take,
+    execute_fused_f64_with_skip_take, filter_mean_fused_f64, filter_multi_stat_f64, filter_sum_fused_f64,
     ObjOp, RustValue, NumericOp,
 };
 use crate::core::numeric::pipeline::{apply_scalar_op, ScalarResult};
@@ -158,7 +158,7 @@ pub(super) fn count_lazy_float_list(
 ) -> usize {
     if skip > 0 || take.is_some() {
         let v = materialize_lazy_float_list(list_ptr);
-        return count_fused_f64_bounded(&v, ops, skip, take);
+        return count_fused_f64_with_skip_take(&v, ops, skip, take);
     }
     let n = unsafe { pyo3::ffi::PyList_Size(list_ptr) as usize };
     let mut total = 0usize;
@@ -173,7 +173,7 @@ pub(super) fn count_lazy_float_list(
                 chunk_buf[j] = pyfloat_as_f64(elem);
             }
         }
-        total += count_fused_f64_bounded(&chunk_buf[..chunk_size], ops, 0, None);
+        total += count_fused_f64_with_skip_take(&chunk_buf[..chunk_size], ops, 0, None);
         i = end;
     }
     total
@@ -327,7 +327,7 @@ pub(super) fn execute_lazy_float_list(
 
     if !use_chunked {
         let v = materialize_lazy_float_list(list_ptr);
-        return execute_fused_f64_bounded(&v, ops, skip, take);
+        return execute_fused_f64_with_skip_take(&v, ops, skip, take);
     }
 
     let mut out = Vec::with_capacity(take_n);
@@ -347,7 +347,7 @@ pub(super) fn execute_lazy_float_list(
         }
 
         let chunk_slice = &chunk_buf[..chunk_size];
-        let filtered = py.allow_threads(|| execute_fused_f64_bounded(chunk_slice, ops, 0, None));
+        let filtered = py.allow_threads(|| execute_fused_f64_with_skip_take(chunk_slice, ops, 0, None));
 
         for val in filtered {
             if skipped < skip {
@@ -632,7 +632,7 @@ pub(super) fn count_by_field(
     // Safety: `values` lives in the enclosing frame, valid for the whole allow_threads call.
     Ok(py.allow_threads(move || {
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
-        count_fused_f64_bounded(slice, &ops_c, skip, take)
+        count_fused_f64_with_skip_take(slice, &ops_c, skip, take)
     }))
 }
 
@@ -650,7 +650,7 @@ struct PreparedFieldOp {
     is_eq: bool,
 }
 
-fn prepare_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<PreparedFieldOp>> {
+fn precompile_obj_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<PreparedFieldOp>> {
     ops.iter()
         .filter_map(|op| {
             let (fname, rv, is_eq) = match op {
@@ -697,7 +697,7 @@ pub(super) fn filter_by_field_py(
     let list_ptr = list.as_ptr();
     let n = list.len();
 
-    let prepared = prepare_field_ops(py, ops)?;
+    let prepared = precompile_obj_field_ops(py, ops)?;
     let map_key: Option<PyObject> =
         map_field.map(|s| pyo3::types::PyString::new_bound(py, s).unbind().into());
 
@@ -782,7 +782,7 @@ pub(super) fn count_by_field_py(
     let list_ptr = list.as_ptr();
     let n = list.len();
 
-    let prepared = prepare_field_ops(py, ops)?;
+    let prepared = precompile_obj_field_ops(py, ops)?;
 
     let mut count = 0usize;
     let mut skipped = 0usize;
@@ -842,7 +842,7 @@ pub(super) fn execute_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        execute_fused_f64_bounded(slice, ops, skip, take)
+        execute_fused_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -859,13 +859,13 @@ pub(super) fn count_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        count_fused_f64_bounded(slice, ops, skip, take)
+        count_fused_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
 
 #[inline]
-fn stats_f64_bounded(
+fn compute_stats_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     skip: usize,
@@ -929,13 +929,13 @@ fn stats_f64_bounded(
 }
 
 #[inline]
-fn var_f64_bounded(
+fn compute_variance_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     skip: usize,
     take: Option<usize>,
 ) -> Option<f64> {
-    let (count, sum, _, _) = stats_f64_bounded(data, ops, skip, take)?;
+    let (count, sum, _, _) = compute_stats_f64_with_skip_take(data, ops, skip, take)?;
     let mean = sum / count as f64;
     let mut seen = 0usize;
     let mut skipped = 0usize;
@@ -981,7 +981,7 @@ pub(super) fn sum_numpy_f64(
                 return s;
             }
         }
-        stats_f64_bounded(slice, ops, skip, take)
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
             .map(|(_, sum, _, _)| sum)
             .unwrap_or(0.0)
     });
@@ -1005,7 +1005,7 @@ pub(super) fn mean_numpy_f64(
                 return mean;
             }
         }
-        stats_f64_bounded(slice, ops, skip, take)
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
             .map(|(count, sum, _, _)| sum / count as f64)
     });
     Ok(result)
@@ -1023,7 +1023,7 @@ pub(super) fn var_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        var_f64_bounded(slice, ops, skip, take)
+        compute_variance_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -1040,7 +1040,7 @@ pub(super) fn min_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        stats_f64_bounded(slice, ops, skip, take).map(|(_, _, min, _)| min)
+        compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, min, _)| min)
     });
     Ok(result)
 }
@@ -1057,7 +1057,7 @@ pub(super) fn max_numpy_f64(
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
-        stats_f64_bounded(slice, ops, skip, take).map(|(_, _, _, max)| max)
+        compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, _, max)| max)
     });
     Ok(result)
 }
@@ -1090,7 +1090,7 @@ pub(super) fn stats_numpy_f64(
                 return filter_multi_stat_f64(slice, ops);
             }
         }
-        stats_f64_bounded(slice, ops, skip, take)
+        compute_stats_f64_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -1108,7 +1108,7 @@ pub(super) fn execute_numpy_f32(
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
-        execute_fused_f32_bounded(slice, ops, skip, take)
+        execute_fused_f32_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -1126,7 +1126,7 @@ pub(super) fn count_numpy_f32(
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.allow_threads(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
-        count_fused_f32_bounded(slice, ops, skip, take)
+        count_fused_f32_with_skip_take(slice, ops, skip, take)
     });
     Ok(result)
 }
@@ -1196,7 +1196,7 @@ mod tests {
             let list = PyList::new_bound(py, &data);
             let ops = vec![NumericOp::FilterGt(5.0)];
 
-            // count_lazy_float_list with skip/take falls back to count_fused_f64_bounded,
+            // count_lazy_float_list with skip/take falls back to count_fused_f64_with_skip_take,
             // which applies filter first, then skip/take on the filtered results.
             // Verify count equals execute path (materialize → filter → skip → take).
             let count = count_lazy_float_list(list.as_ptr(), &ops, 2, Some(5));

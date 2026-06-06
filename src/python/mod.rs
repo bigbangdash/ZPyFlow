@@ -1,9 +1,15 @@
 pub mod agg;
+pub mod columnar;
 mod conversion;
 pub mod expr;
 mod fastpath;
 mod io_bridge;
+pub mod join;
 pub mod query;
+pub mod schema;
 pub use agg::PyAggSpec;
+pub use columnar::_convert_to_columnar;
 pub use expr::{field, PyColProxy, PyExpr, PyFieldExpr};
+pub use join::_hash_join_by_field;
 pub use query::PyQuery;
+pub use schema::_infer_schema;

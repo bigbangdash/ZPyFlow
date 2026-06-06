@@ -24,9 +24,10 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyDict, PyList};
 
 use super::agg::{AggSpecKind, GroupKey};
+use super::columnar::{apply_columnar_ops, ColumnarData, columnar_indices_to_py_list};
 use super::conversion::rust_row_to_py;
 use super::expr::{ExprOp, PyExpr, PyFieldExpr};
 use super::fastpath::{
@@ -35,7 +36,7 @@ use super::fastpath::{
 };
 use crate::io::ParsedOutput;
 use crate::core::{
-    eval_filter_i64, execute_fused_f64_bounded, execute_fused_i64_bounded, execute_obj_pipeline, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
+    eval_filter_i64, execute_fused_f64_with_skip_take, execute_fused_i64_with_skip_take, execute_obj_pipeline, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
     RustValue,
 };
 use ahash::AHashMap;
@@ -44,22 +45,8 @@ use std::sync::Arc;
 fn native_slice_as_bytes<T>(values: &[T]) -> &[u8] {
     let byte_len = values.len() * std::mem::size_of::<T>();
     // Native numeric Vecs are plain contiguous POD values. PyBytes copies this
-    // slice before the Vec is dropped, and numpy receives an owned copy below.
+    // slice once; callers reconstruct a typed array from those bytes in Python.
     unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) }
-}
-
-fn native_vec_to_numpy<'py, T>(
-    py: Python<'py>,
-    values: Vec<T>,
-    dtype_name: &str,
-) -> PyResult<PyObject> {
-    let np = py.import_bound("numpy")?;
-    let raw = native_slice_as_bytes(&values);
-    let bytes = PyBytes::new_bound(py, raw);
-    let kwargs = PyDict::new_bound(py);
-    kwargs.set_item("dtype", np.getattr(dtype_name)?)?;
-    let arr = np.getattr("frombuffer")?.call((bytes,), Some(&kwargs))?;
-    Ok(arr.call_method0("copy")?.unbind())
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +138,16 @@ enum QueryInner {
         source: PyObject,
         ops: Vec<ObjOp>,
         map_field: Option<Arc<str>>,
+    },
+    /// Columnar layout for list-of-dicts (spec-082 T3).
+    ///
+    /// The source list-of-dicts is converted to `ColumnarData` once (at `.preload()`
+    /// or implicitly on the first `field()` DSL filter).  Subsequent `field()` ops
+    /// accumulate as `ObjOp` entries executed in a single Rust loop that accesses
+    /// typed column slices directly — no per-row Python dict lookup.
+    ColumnarObj {
+        data: Arc<ColumnarData>,
+        ops: Vec<ObjOp>,
     },
     /// Already-consumed or empty
     #[allow(dead_code)]
@@ -258,6 +255,11 @@ pub(super) fn collect_to_pylist(q: &PyQuery, py: Python<'_>) -> PyResult<Py<pyo3
         QueryInner::ObjFieldPy { source, ops, map_field } => {
             let items = filter_by_field_py(py, source, ops, q.skip, q.take, map_field.as_deref())?;
             Ok(PyList::new_bound(py, items.iter().map(|o| o.bind(py))).into())
+        }
+        QueryInner::ColumnarObj { data, ops } => {
+            let indices = apply_columnar_ops(data, ops, q.skip, q.take);
+            let rows = columnar_indices_to_py_list(py, data, &indices)?;
+            Ok(PyList::new_bound(py, rows.iter().map(|o| o.bind(py))).into())
         }
         QueryInner::Empty => Ok(PyList::empty_bound(py).into()),
     }
@@ -412,7 +414,10 @@ fn group_agg_field_count(
     // ── Obj path: iterate Python dicts directly, no dict→RustRow conversion ──
     // Uses PyDict for key→index map (Python hash/eq handles any hashable key type).
     match &query.inner {
-        QueryInner::Obj { .. } | QueryInner::ObjField { .. } | QueryInner::ObjFieldPy { .. } => {}
+        QueryInner::Obj { .. }
+        | QueryInner::ObjField { .. }
+        | QueryInner::ObjFieldPy { .. }
+        | QueryInner::ColumnarObj { .. } => {}
         QueryInner::Empty => return agg_build_result(py, vec![], vec![], names, kinds),
         _ => {
             return Err(PyValueError::new_err(
@@ -544,6 +549,10 @@ fn clone_inner(py: Python<'_>, inner: &QueryInner) -> QueryInner {
             source: source.clone_ref(py),
             ops: ops.clone(),
             map_field: map_field.as_ref().map(Arc::clone),
+        },
+        QueryInner::ColumnarObj { data, ops } => QueryInner::ColumnarObj {
+            data: Arc::clone(data),
+            ops: ops.clone(),
         },
         QueryInner::Empty => QueryInner::Empty,
     }
@@ -730,12 +739,12 @@ fn execute_f64(
         if parallel {
             return NumericPipeline::from_arc(Arc::clone(&data))
                 .with_ops(ops)
-                .execute_parallel_bounded(skip, take);
+                .execute_parallel_with_skip_take(skip, take);
         }
         // skip and take are passed as explicit bounds — NOT inserted into ops.
         // Semantics: skip = source-level (before filters), take = output-level (after filters).
         // This avoids the O(n) ops.insert(0, ...) and clarifies execution order.
-        execute_fused_f64_bounded(&data, &ops, skip, take)
+        execute_fused_f64_with_skip_take(&data, &ops, skip, take)
     })
 }
 
@@ -754,9 +763,9 @@ fn execute_i64(
         if parallel {
             return IntPipeline::from_arc(Arc::clone(&data))
                 .with_ops(ops)
-                .execute_parallel_bounded(skip, take);
+                .execute_parallel_with_skip_take(skip, take);
         }
-        execute_fused_i64_bounded(&data, &ops, skip, take)
+        execute_fused_i64_with_skip_take(&data, &ops, skip, take)
     })
 }
 
@@ -769,10 +778,10 @@ fn execute_u8(
 ) -> Vec<i64> {
     let data = Arc::clone(data);
     let ops = ops.to_vec();
-    py.allow_threads(move || execute_u8_bounded(&data, &ops, skip, take))
+    py.allow_threads(move || execute_u8_with_skip_take(&data, &ops, skip, take))
 }
 
-fn execute_u8_bounded(
+fn execute_u8_with_skip_take(
     data: &[u8],
     ops: &[IntOp],
     out_skip: usize,
@@ -801,7 +810,7 @@ fn execute_u8_bounded(
     out
 }
 
-fn count_u8_bounded(data: &[u8], ops: &[IntOp], out_skip: usize, out_take: Option<usize>) -> usize {
+fn count_u8_with_skip_take(data: &[u8], ops: &[IntOp], out_skip: usize, out_take: Option<usize>) -> usize {
     // Fast path: single filter op, no skip/take — compare u8 directly, no i64 cast.
     // The compiler auto-vectorizes these simple byte-level filter+count loops.
     if out_skip == 0 && out_take.is_none() && ops.len() == 1 {
@@ -888,7 +897,7 @@ fn count_u8_bounded(data: &[u8], ops: &[IntOp], out_skip: usize, out_take: Optio
     count
 }
 
-fn sum_u8_bounded(data: &[u8], ops: &[IntOp], out_skip: usize, out_take: Option<usize>) -> i64 {
+fn sum_u8_with_skip_take(data: &[u8], ops: &[IntOp], out_skip: usize, out_take: Option<usize>) -> i64 {
     let mut sum = 0i64;
     let mut emitted = 0usize;
     let mut skipped = 0usize;
@@ -931,17 +940,35 @@ fn collect_i64_pipeline(
     Ok(execute_i64(py, pipeline, skip, take, false))
 }
 
-/// Apply a Python filter predicate to f64 data (GIL held).
+/// Batch size for chunked Python predicate calls.
+/// Reduces Rust→Python FFI roundtrips from N to N/FILTER_CHUNK_SIZE.
+const FILTER_CHUNK_SIZE: usize = 256;
+
+/// Get Python builtins `filter` and `list` callables (cached inline).
+fn py_filter_list<'py>(
+    py: Python<'py>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let b = py.import_bound("builtins")?;
+    Ok((b.getattr("filter")?, b.getattr("list")?))
+}
+
+/// Apply a Python filter predicate to f64 data.
+///
+/// Processes data in chunks of FILTER_CHUNK_SIZE, calling `list(filter(pred, chunk))`
+/// once per chunk. This moves N predicate invocations from Rust's call1 machinery
+/// into Python's C evaluation loop, reducing FFI roundtrips by ~256x.
 fn apply_py_filter_f64(
     py: Python<'_>,
     data: Vec<f64>,
     pred: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<f64>> {
+    let (filter_fn, list_fn) = py_filter_list(py)?;
     let mut out = Vec::with_capacity(data.len() / 2);
-    for val in data {
-        let py_val = val.into_py(py);
-        if pred.call1((py_val,))?.is_truthy()? {
-            out.push(val);
+    for chunk in data.chunks(FILTER_CHUNK_SIZE) {
+        let py_chunk = PyList::new_bound(py, chunk.iter().map(|&v| v));
+        let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
+        for item in filtered.downcast::<PyList>()? {
+            out.push(item.extract::<f64>()?);
         }
     }
     Ok(out)
@@ -952,11 +979,13 @@ fn apply_py_filter_i64(
     data: Vec<i64>,
     pred: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<i64>> {
+    let (filter_fn, list_fn) = py_filter_list(py)?;
     let mut out = Vec::with_capacity(data.len() / 2);
-    for val in data {
-        let py_val = val.into_py(py);
-        if pred.call1((py_val,))?.is_truthy()? {
-            out.push(val);
+    for chunk in data.chunks(FILTER_CHUNK_SIZE) {
+        let py_chunk = PyList::new_bound(py, chunk.iter().map(|&v| v));
+        let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
+        for item in filtered.downcast::<PyList>()? {
+            out.push(item.extract::<i64>()?);
         }
     }
     Ok(out)
@@ -969,22 +998,20 @@ fn apply_py_filter(
     skip: usize,
     take: Option<usize>,
 ) -> PyResult<Vec<PyObject>> {
-    let mut out = Vec::new();
-    let cap = take.unwrap_or(items.len().saturating_sub(skip));
-    out.reserve(cap);
+    let items = &items[skip.min(items.len())..];
+    let cap = take.unwrap_or(items.len());
+    let mut out = Vec::with_capacity(cap);
 
-    let mut skipped = 0;
-    for item in items {
-        if skipped < skip {
-            skipped += 1;
-            continue;
-        }
-        if pred.call1((item.clone_ref(py),))?.is_truthy()? {
-            out.push(item.clone_ref(py));
-        }
-        if let Some(n) = take {
-            if out.len() >= n {
-                break;
+    let (filter_fn, list_fn) = py_filter_list(py)?;
+    'outer: for chunk in items.chunks(FILTER_CHUNK_SIZE) {
+        let py_chunk = PyList::new_bound(py, chunk.iter().map(|o| o.clone_ref(py)));
+        let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
+        for item in filtered.downcast::<PyList>()? {
+            out.push(item.unbind());
+            if let Some(n) = take {
+                if out.len() >= n {
+                    break 'outer;
+                }
             }
         }
     }

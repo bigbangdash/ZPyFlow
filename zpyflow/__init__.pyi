@@ -5,7 +5,7 @@ Type stubs for ZPyFlow — enables IDE autocomplete, mypy, and pyright checking.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Generic, Iterable, Iterator, Literal, TypeVar, overload
+from typing import Any, Callable, Generator, Generic, Iterable, Iterator, Literal, TypeVar, overload
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -121,7 +121,7 @@ class FieldExpr:
     def endswith(self, suffix: str) -> FieldExpr: ...
     def contains(self, sub: str) -> FieldExpr: ...
     def matches(self, pattern: str) -> FieldExpr: ...
-    def __call__(self, row: dict[str, Any]) -> bool: ...
+    def __call__(self, row: dict[str, Any]) -> Any: ...
 
 
 def field(name: str) -> FieldExpr:
@@ -472,6 +472,41 @@ class Query(Generic[T]):
         """
         ...
 
+    def join(
+        self,
+        other: "Query[U]",
+        on: "str | Callable[[Any], Any] | tuple[str | Callable[[Any], Any], str | Callable[[Any], Any]] | None" = None,
+        how: Literal["inner", "left", "right", "cross"] = "inner",
+    ) -> "Query[Any]":
+        """SQL-style hash join between two Queries.
+
+        Result rows are merged dicts (right wins on collision) when both sides
+        are dicts; otherwise tuples ``(left, right)``.
+
+        Parameters
+        ----------
+        other:
+            Right-hand Query to join against.
+        on:
+            Key spec — string ``"field"``, callable, or 2-tuple for different keys
+            per side.  Required for inner/left/right; omit for ``how="cross"``.
+        how:
+            ``"inner"`` (default), ``"left"``, ``"right"``, or ``"cross"``.
+
+        Example::
+
+            orders  = Query([{"id": 1, "item": "A"}, {"id": 2, "item": "B"}])
+            details = Query([{"id": 1, "price": 9.9}])
+
+            orders.join(details, on="id").to_list()
+            # [{"id": 1, "item": "A", "price": 9.9}]
+
+            orders.join(details, on="id", how="left").to_list()
+            # [{"id": 1, "item": "A", "price": 9.9},
+            #  {"id": 2, "item": "B", "price": None}]
+        """
+        ...
+
     def inner_join(
         self,
         other: "Query[U]",
@@ -696,6 +731,46 @@ class Query(Generic[T]):
         """
         ...
 
+    def window(self, size: int, step: int = 1) -> "Query[list[T]]":
+        """Sliding or tumbling window — generalised :meth:`sliding_window`.
+
+        Returns lists (not tuples) and supports a *step* parameter.
+        ``step=1`` is rolling; ``step=size`` is tumbling (non-overlapping).
+
+        Example::
+
+            Query([1, 2, 3, 4, 5]).window(3).to_list()
+            # [[1, 2, 3], [2, 3, 4], [3, 4, 5]]
+
+            Query([1, 2, 3, 4]).window(2, step=2).to_list()
+            # [[1, 2], [3, 4]]
+        """
+        ...
+
+    def rolling_sum(self, window: int) -> "Query[float]":
+        """Sliding-window sum — O(N) running-sum kernel.
+
+        Produces ``len - window + 1`` values.  Rust SIMD path for F64 data.
+
+        Example::
+
+            Query([1.0, 2.0, 3.0, 4.0]).rolling_sum(2).to_list()
+            # [3.0, 5.0, 7.0]
+        """
+        ...
+
+    def rolling_mean(self, window: int) -> "Query[float]":
+        """Sliding-window mean — O(N) running-sum kernel.
+
+        Produces ``len - window + 1`` values.  Rust SIMD path for F64 data.
+
+        Example::
+
+            Query([1.0, 2.0, 3.0, 4.0]).rolling_mean(2).to_list()
+            # [1.5, 2.5, 3.5]
+        """
+        ...
+
     def enumerate(self) -> Query[tuple[int, T]]:
         """Pair each element with its 0-based index, yielding ``(int, element)`` tuples."""
         ...
@@ -709,7 +784,11 @@ class Query(Generic[T]):
         ...
 
     def preload(self) -> Query[T]:
-        """Convert dict records to RustObj eagerly (pay GIL cost once, query many times).
+        """Convert dict records to columnar layout (pay GIL cost once, query many times).
+
+        Transforms a list-of-dicts into typed column slices (``ColumnarObj``).
+        Subsequent ``field()`` DSL filters scan column arrays directly — no
+        per-row Python dict lookup.
 
         Useful when the same dataset is queried repeatedly::
 
@@ -779,6 +858,25 @@ class Query(Generic[T]):
         """Return the product of all elements (1 for empty pipeline)."""
         ...
 
+    def find(self, pred: Callable[[T], bool]) -> T | None:
+        """Return the first element matching *pred*, or ``None`` if not found.
+
+        Short-circuits — iteration stops as soon as a match is found.
+        """
+        ...
+
+    def count_if(self, pred: Callable[[T], bool]) -> int:
+        """Count elements satisfying *pred* in a single pass."""
+        ...
+
+    def sum_by(self, fn: Callable[[T], float]) -> float:
+        """Sum of ``fn(item)`` over all elements in a single pass."""
+        ...
+
+    def mean_by(self, fn: Callable[[T], float]) -> float | None:
+        """Arithmetic mean of ``fn(item)``; ``None`` if empty."""
+        ...
+
     # ------------------------------------------------------------------
     # Terminal operations
     # ------------------------------------------------------------------
@@ -787,32 +885,50 @@ class Query(Generic[T]):
         """Materialise the pipeline into a Python list (allocates once)."""
         ...
 
-    def to_numpy(self) -> Any:
-        """Materialise the pipeline into a numpy ndarray (no per-element boxing).
+    def to_arrow(self) -> Any:
+        """Materialise as a PyArrow Array or RecordBatch.
 
-        Imports numpy only when this method is called; ZPyFlow itself does not
-        depend on the Python numpy package for import/build.  Numeric values are
-        transferred as raw bytes, avoiding Python float/int boxing, then copied
-        once to return a writable, owned array.
+        - **F64 path** — raw bytes via ``to_bytes()``, zero-copy into Arrow buffer.
+          Returns ``pyarrow.Array<float64>``.
+        - **ColumnarObj path** (after ``.preload()``) — typed column arrays →
+          ``pyarrow.RecordBatch`` with inferred schema (no per-row dict reconstruction).
+        - **Other paths** — ``to_list()`` with Arrow type inference.
 
-        Dtype mapping:
-
-        =============  ==========
-        Pipeline kind  numpy dtype
-        =============  ==========
-        f64            float64
-        i64            int64
-        u8             int64 after pending numeric ops
-        =============  ==========
-
-        Raises ``ValueError`` for object/Py pipelines.  Use
-        ``np.array(q.to_list())`` for those.
+        Requires ``pyarrow``.
 
         Example::
 
-            import numpy as np
-            arr = Query(data).filter(col > 0).map(col * 2).to_numpy()
-            # arr is a writable np.ndarray[float64]
+            arr = Query([1.0, 2.0, 3.0]).filter(col > 1.0).to_arrow()
+            # pyarrow.Array<float64>: [2.0, 3.0]
+
+            rb = Query(logs).preload().filter(field("score") > 0.5).to_arrow()
+            # pyarrow.RecordBatch with schema {score: float64, ...}
+        """
+        ...
+
+    def to_polars(self) -> Any:
+        """Materialise as a Polars Series (numeric) or DataFrame (object).
+
+        Delegates to ``to_arrow()`` and wraps via ``polars.from_arrow()``.
+        Requires ``polars``.
+
+        Example::
+
+            s = Query([1.0, 2.0, 3.0]).filter(col > 1.0).to_polars()
+            # polars.Series: [2.0, 3.0]
+        """
+        ...
+
+    def to_pandas(self) -> Any:
+        """Materialise as a pandas Series.
+
+        Delegates to ``to_arrow().to_pandas()``.
+        Requires ``pandas`` and ``pyarrow``.
+
+        Example::
+
+            s = Query([1.0, 2.0, 3.0]).filter(col > 1.0).to_pandas()
+            # pandas.Series: [2.0, 3.0]
         """
         ...
 
@@ -1025,6 +1141,64 @@ def from_csv(
         Field separator (single character).
     has_header:
         Whether the first row contains column names.
+    """
+    ...
+
+
+def from_csv_chunked(
+    path_or_file: str | Path | Any,
+    chunk_size: int = 10_000,
+    column: str | int | None = None,
+    dtype: Literal["auto", "float", "int", "str"] = "auto",
+    delimiter: str = ",",
+    has_header: bool = True,
+) -> Generator[Query[Any], None, None]:
+    """Stream a large CSV as an iterator of :class:`Query` objects (spec-081 T1).
+
+    Yields one ``Query`` per ``chunk_size`` rows.  Memory is bounded by chunk
+    size — the file is never fully loaded into RAM.
+
+    Parameters
+    ----------
+    path_or_file:
+        ``str`` / ``Path`` or text-mode file-like.
+    chunk_size:
+        Number of data rows per yielded ``Query`` (last chunk may be smaller).
+    column:
+        Column name or 0-based index to extract.  ``None`` → dict-per-row.
+    dtype:
+        Value coercion for the extracted column (``"auto"`` = int → float → str).
+    delimiter:
+        Field separator (single character).
+    has_header:
+        Whether the first row contains column names.
+
+    Example::
+
+        total = 0
+        for q in from_csv_chunked("large.csv", chunk_size=50_000):
+            total += q.count()
+    """
+    ...
+
+
+def from_arrow_ipc(
+    path: str | Path,
+    column: str | int | None = None,
+) -> Query[Any]:
+    """Read an Arrow IPC file or stream and return a :class:`Query`.
+
+    Supports both Arrow **file** format (random-access) and Arrow **stream**
+    format.  Single-column numeric files are read zero-copy via the buffer
+    protocol.  Multi-column tables become dict-row Queries.
+
+    Parameters
+    ----------
+    path:
+        Path to the ``.arrow`` / ``.arrows`` file.
+    column:
+        Column name or 0-based index to extract.  *None* auto-extracts when
+        the file has exactly one column; otherwise returns dict rows.
     """
     ...
 

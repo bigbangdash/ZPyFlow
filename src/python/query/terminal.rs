@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::python::agg::{AggSpecKind, GroupKey, PyAggSpec};
+use crate::python::columnar::{apply_columnar_ops, columnar_indices_to_py_list, ColumnVec};
 use crate::python::conversion::{rust_row_to_py, try_convert_to_rust_obj};
 use crate::python::expr::{ExprOp, PyExpr, PyFieldExpr};
 use crate::python::fastpath::{
@@ -18,22 +19,22 @@ use crate::python::fastpath::{
 use crate::python::io_bridge::{csv_col_spec, parse_csv, parse_jsonl};
 use crate::io::ParsedOutput;
 use crate::core::{
-    count_fused_f64_bounded, count_fused_i64_bounded, count_obj_pipeline, eval_filter_f64,
-    eval_filter_i64, execute_fused_f64_bounded, execute_fused_i64_bounded, execute_obj_pipeline,
-    filter_multi_stat_f64, max_fused_f64_bounded, mean_fused_f64_bounded, min_fused_f64_bounded,
-    row_passes, stats_fused_f64_bounded, sum_field_obj_pipeline, sum_fused_f64_bounded,
-    var_fused_f64_bounded, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
+    count_fused_f64_with_skip_take, count_fused_i64_with_skip_take, count_obj_pipeline, eval_filter_f64,
+    eval_filter_i64, execute_fused_f64_with_skip_take, execute_fused_i64_with_skip_take, execute_obj_pipeline,
+    filter_multi_stat_f64, max_fused_f64_with_skip_take, mean_fused_f64_with_skip_take, min_fused_f64_with_skip_take,
+    row_passes, stats_fused_f64_with_skip_take, sum_field_obj_pipeline, sum_fused_f64_with_skip_take,
+    var_fused_f64_with_skip_take, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
     RustValue,
 };
 use super::{
     agg_build_result, agg_init_acc, agg_update, apply_py_filter, apply_py_filter_f64,
     apply_py_filter_i64, apply_py_map, apply_py_map_f64, apply_py_map_i64, apply_skip_take,
     bind_ops, branch_f64_pipeline, branch_i64_pipeline, clone_inner, collect_f64_pipeline,
-    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_bounded, execute_f64,
-    execute_i64, execute_u8, execute_u8_bounded, expr_to_int_op, group_agg_field_count,
+    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_with_skip_take, execute_f64,
+    execute_i64, execute_u8, execute_u8_with_skip_take, expr_to_int_op, group_agg_field_count,
     group_by_collect as group_by_collect_fn, group_key_from_rust_value, group_key_to_py,
-    group_keys_to_py, native_slice_as_bytes, native_vec_to_numpy, parsed_to_query,
-    push_numeric_op, sum_u8_bounded, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, PyPipelineOp, PyQuery, QueryInner, take_query,
+    group_keys_to_py, native_slice_as_bytes, parsed_to_query,
+    push_numeric_op, sum_u8_with_skip_take, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, PyPipelineOp, PyQuery, QueryInner, take_query,
 };
 use ahash::AHashMap;
 use std::sync::Arc;
@@ -116,6 +117,11 @@ impl PyQuery {
                 )?;
                 Ok(PyList::new_bound(py, items.iter().map(|o| o.bind(py))).into())
             }
+            QueryInner::ColumnarObj { data, ops } => {
+                let indices = apply_columnar_ops(data, ops, self.skip, self.take);
+                let rows = columnar_indices_to_py_list(py, data, &indices)?;
+                Ok(PyList::new_bound(py, rows.iter().map(|o| o.bind(py))).into())
+            }
             QueryInner::Empty => Ok(PyList::empty_bound(py).into()),
         }
     }
@@ -163,59 +169,97 @@ impl PyQuery {
         }
     }
 
-    /// Return the pipeline result as a numpy ndarray.
+    /// Return raw bytes of the pipeline result together with a dtype name string.
     ///
-    /// Imports Python numpy only when this method is called. The Rust core does
-    /// not link to the numpy crate. Numeric output is copied as raw bytes into
-    /// numpy, avoiding per-element Python float/int boxing, then copied once more
-    /// to return a writable, owned ndarray.
+    /// Returns a Python tuple `(bytes, dtype_str)` where `dtype_str` is one of
+    /// `"float64"`, `"int64"`, or `"float32"`.  The caller (Python `to_numpy()`)
+    /// is responsible for constructing a numpy array from those bytes.
     ///
-    /// Dtype mapping:
-    ///   f64 pipeline → np.float64
-    ///   i64 pipeline → np.int64
-    ///   u8 pipeline  → np.int64 after pending numeric ops
+    /// Keeping numpy out of Rust: Rust converts Vec<T> → raw bytes only.
+    /// numpy is imported in Python, not here.
     ///
-    /// Raises ValueError for object/Py pipelines — use `to_list()` + `np.array()`.
-    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    /// Raises ValueError for object/Py pipelines — use `to_list()` for those.
+    fn _to_raw_numeric_bytes(&self, py: Python<'_>) -> PyResult<(Py<PyBytes>, &'static str)> {
         match &self.inner {
             QueryInner::F64(pipeline) => {
                 let result = execute_f64(py, pipeline, self.skip, self.take, self.parallel);
-                native_vec_to_numpy(py, result, "float64")
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "float64"))
             }
             QueryInner::I64(pipeline) => {
                 let result = execute_i64(py, pipeline, self.skip, self.take, self.parallel);
-                native_vec_to_numpy(py, result, "int64")
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "int64"))
             }
             QueryInner::U8 { data, ops } => {
                 let data = Arc::clone(data);
                 let ops = ops.clone();
                 let skip = self.skip;
                 let take = self.take;
-                let result = py.allow_threads(move || execute_u8_bounded(&data, &ops, skip, take));
-                native_vec_to_numpy(py, result, "int64")
+                let result = py.allow_threads(move || execute_u8_with_skip_take(&data, &ops, skip, take));
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "int64"))
             }
             QueryInner::LazyFloatList { source, ops } => {
-                let result =
-                    execute_lazy_float_list(py, source.as_ptr(), ops, self.skip, self.take);
-                native_vec_to_numpy(py, result, "float64")
+                let result = execute_lazy_float_list(py, source.as_ptr(), ops, self.skip, self.take);
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "float64"))
             }
             QueryInner::NumpyF64 { source, ops } => {
                 let result = execute_numpy_f64(py, source, ops, self.skip, self.take)?;
-                native_vec_to_numpy(py, result, "float64")
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "float64"))
             }
             QueryInner::NumpyF32 { source, ops } => {
                 let result = execute_numpy_f32(py, source, ops, self.skip, self.take)?;
-                native_vec_to_numpy(py, result, "float32")
+                Ok((PyBytes::new_bound(py, native_slice_as_bytes(&result)).into(), "float32"))
             }
             QueryInner::Empty => {
-                let empty: Vec<f64> = vec![];
-                native_vec_to_numpy(py, empty, "float64")
+                Ok((PyBytes::new_bound(py, &[]).into(), "float64"))
             }
             _ => Err(PyValueError::new_err(
-                "to_numpy() is only supported for numeric pipelines (f64/i64/u8). \
+                "_to_raw_numeric_bytes() is only supported for numeric pipelines (f64/i64/u8). \
                  Use to_list() for object pipelines, or preload() to materialise first.",
             )),
         }
+    }
+
+    /// Extract columnar data for Arrow / Polars / pandas output (spec-083 T2).
+    ///
+    /// Returns `None` for non-ColumnarObj paths (caller falls back to to_list()).
+    ///
+    /// Returns a Python dict `{col_name: {"dtype": str, "data": list, "nulls": list[bool]}}`
+    /// where `nulls[i] == True` means null.  The Python layer builds a RecordBatch from this.
+    fn _to_columnar_arrow_data(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let (data, ops) = match &self.inner {
+            QueryInner::ColumnarObj { data, ops } => (data, ops),
+            _ => return Ok(py.None()),
+        };
+
+        let indices = apply_columnar_ops(data, ops, self.skip, self.take);
+
+        let result = PyDict::new_bound(py);
+        for (name, col) in &data.columns {
+            let entry = PyDict::new_bound(py);
+            let dtype_str = match &col.data {
+                ColumnVec::F64(_)  => "f64",
+                ColumnVec::I64(_)  => "i64",
+                ColumnVec::Str(_)  => "str",
+                ColumnVec::PyObj(_) => "mixed",
+            };
+            entry.set_item("dtype", dtype_str)?;
+
+            let values = PyList::empty_bound(py);
+            let nulls  = PyList::empty_bound(py);
+            for &i in &indices {
+                nulls.append(col.nulls[i])?;
+                match &col.data {
+                    ColumnVec::F64(v)   => values.append(v[i])?,
+                    ColumnVec::I64(v)   => values.append(v[i])?,
+                    ColumnVec::Str(v)   => values.append(v[i].as_str())?,
+                    ColumnVec::PyObj(v) => values.append(v[i].bind(py))?,
+                }
+            }
+            entry.set_item("data", values)?;
+            entry.set_item("nulls", nulls)?;
+            result.set_item(name, entry)?;
+        }
+        Ok(result.into())
     }
 
     /// Group elements by key_fn in a single pass, applying pending filter/map ops.
@@ -310,21 +354,21 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                Ok(py.allow_threads(move || count_fused_f64_bounded(&data, &ops, skip, take)))
+                Ok(py.allow_threads(move || count_fused_f64_with_skip_take(&data, &ops, skip, take)))
             }
             QueryInner::I64(pipeline) => {
                 let data = pipeline.arc();
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                Ok(py.allow_threads(move || count_fused_i64_bounded(&data, &ops, skip, take)))
+                Ok(py.allow_threads(move || count_fused_i64_with_skip_take(&data, &ops, skip, take)))
             }
             QueryInner::U8 { data, ops } => {
                 let data = Arc::clone(data);
                 let ops = ops.clone();
                 let skip = self.skip;
                 let take = self.take;
-                Ok(py.allow_threads(move || count_u8_bounded(&data, &ops, skip, take)))
+                Ok(py.allow_threads(move || count_u8_with_skip_take(&data, &ops, skip, take)))
             }
             QueryInner::Py(items) => Ok(apply_skip_take(items, self.skip, self.take).len()),
             QueryInner::Obj { source, ops } => count_py_lazy(py, source, ops, self.skip, self.take),
@@ -353,6 +397,9 @@ impl PyQuery {
             } => count_by_field(py, source, field_name, ops, self.skip, self.take),
             QueryInner::ObjFieldPy { source, ops, .. } => {
                 count_by_field_py(py, source, ops, self.skip, self.take)
+            }
+            QueryInner::ColumnarObj { data, ops } => {
+                Ok(apply_columnar_ops(data, ops, self.skip, self.take).len())
             }
             QueryInner::Empty => Ok(0),
         }
@@ -386,7 +433,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let s = py.allow_threads(|| sum_fused_f64_bounded(&data, &ops, skip, take));
+                let s = py.allow_threads(|| sum_fused_f64_with_skip_take(&data, &ops, skip, take));
                 Ok(s.into_py(py))
             }
             QueryInner::I64(pipeline) => {
@@ -399,13 +446,14 @@ impl PyQuery {
                 let ops = ops.clone();
                 let skip = self.skip;
                 let take = self.take;
-                let s: i64 = py.allow_threads(move || sum_u8_bounded(&data, &ops, skip, take));
+                let s: i64 = py.allow_threads(move || sum_u8_with_skip_take(&data, &ops, skip, take));
                 Ok(s.into_py(py))
             }
             QueryInner::Py(_)
             | QueryInner::Obj { .. }
             | QueryInner::ObjField { .. }
-            | QueryInner::ObjFieldPy { .. } => {
+            | QueryInner::ObjFieldPy { .. }
+            | QueryInner::ColumnarObj { .. } => {
                 let list = self.to_list(py)?;
                 let builtins = py.import_bound("builtins")?;
                 let result = builtins.getattr("sum")?.call1((list,))?;
@@ -525,12 +573,24 @@ impl PyQuery {
                 }
                 Ok(acc.into_py(py))
             }
-            _ => {
+            QueryInner::ColumnarObj { .. } => {
                 let list = self.to_list(py)?;
-                let builtins = py.import_bound("builtins")?;
-                let result = builtins.getattr("sum")?.call1((list,))?;
-                Ok(result.into())
+                let mut acc = 0.0f64;
+                for item in list.bind(py).iter() {
+                    if let Ok(dict) = item.downcast::<PyDict>() {
+                        if let Ok(Some(v)) = dict.get_item(field_name) {
+                            acc += v
+                                .extract::<f64>()
+                                .or_else(|_| v.extract::<i64>().map(|i| i as f64))
+                                .unwrap_or(0.0);
+                        }
+                    }
+                }
+                Ok(acc.into_py(py))
             }
+            _ => Err(pyo3::exceptions::PyTypeError::new_err(
+                "sum_field() is only supported for object/dict pipelines",
+            )),
         }
     }
 
@@ -546,7 +606,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let mean = py.allow_threads(|| mean_fused_f64_bounded(&data, &ops, skip, take));
+                let mean = py.allow_threads(|| mean_fused_f64_with_skip_take(&data, &ops, skip, take));
                 Ok(mean.map_or_else(|| py.None(), |v| v.into_py(py)))
             }
             QueryInner::I64(pipeline) => {
@@ -566,8 +626,8 @@ impl PyQuery {
                 let skip = self.skip;
                 let take = self.take;
                 let mean = py.allow_threads(move || {
-                    let s = sum_u8_bounded(&data, &ops, skip, take);
-                    let n = count_u8_bounded(&data, &ops, skip, take);
+                    let s = sum_u8_with_skip_take(&data, &ops, skip, take);
+                    let n = count_u8_with_skip_take(&data, &ops, skip, take);
                     if n == 0 {
                         None
                     } else {
@@ -610,7 +670,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let v = py.allow_threads(|| var_fused_f64_bounded(&data, &ops, skip, take));
+                let v = py.allow_threads(|| var_fused_f64_with_skip_take(&data, &ops, skip, take));
                 Ok(v.map_or_else(|| py.None(), |v| v.into_py(py)))
             }
             QueryInner::I64(pipeline) => {
@@ -701,7 +761,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let result = py.allow_threads(|| min_fused_f64_bounded(&data, &ops, skip, take));
+                let result = py.allow_threads(|| min_fused_f64_with_skip_take(&data, &ops, skip, take));
                 Ok(result.map_or_else(|| py.None(), |v| v.into_py(py)))
             }
             _ => {
@@ -736,7 +796,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let result = py.allow_threads(|| max_fused_f64_bounded(&data, &ops, skip, take));
+                let result = py.allow_threads(|| max_fused_f64_with_skip_take(&data, &ops, skip, take));
                 Ok(result.map_or_else(|| py.None(), |v| v.into_py(py)))
             }
             _ => {
@@ -786,7 +846,7 @@ impl PyQuery {
                 let ops = pipeline.clone_ops();
                 let skip = self.skip;
                 let take = self.take;
-                let result = py.allow_threads(|| stats_fused_f64_bounded(&data, &ops, skip, take));
+                let result = py.allow_threads(|| stats_fused_f64_with_skip_take(&data, &ops, skip, take));
                 to_dict(py, result)
             }
             QueryInner::LazyFloatList { source, ops } => {
@@ -878,11 +938,11 @@ impl PyQuery {
                                 if skip == 0 && take.is_none() {
                                     let mut ops = base_ops;
                                     ops.push(op);
-                                    count_fused_f64_bounded(&data, &ops, 0, None)
+                                    count_fused_f64_with_skip_take(&data, &ops, 0, None)
                                 } else {
                                     let bounded =
-                                        execute_fused_f64_bounded(&data, &base_ops, skip, take);
-                                    count_fused_f64_bounded(&bounded, &[op], 0, None)
+                                        execute_fused_f64_with_skip_take(&data, &base_ops, skip, take);
+                                    count_fused_f64_with_skip_take(&bounded, &[op], 0, None)
                                 }
                             });
                             return Ok(n > 0);
@@ -910,11 +970,11 @@ impl PyQuery {
                                 if skip == 0 && take.is_none() {
                                     let mut ops = base_ops;
                                     ops.push(op);
-                                    count_fused_i64_bounded(&data, &ops, 0, None)
+                                    count_fused_i64_with_skip_take(&data, &ops, 0, None)
                                 } else {
                                     let bounded =
-                                        execute_fused_i64_bounded(&data, &base_ops, skip, take);
-                                    count_fused_i64_bounded(&bounded, &[op], 0, None)
+                                        execute_fused_i64_with_skip_take(&data, &base_ops, skip, take);
+                                    count_fused_i64_with_skip_take(&bounded, &[op], 0, None)
                                 }
                             });
                             return Ok(n > 0);
@@ -938,7 +998,7 @@ impl PyQuery {
                             check_ops.push(op);
                             let (skip, take) = (self.skip, self.take);
                             let n = py.allow_threads(move || {
-                                count_u8_bounded(&data, &check_ops, skip, take)
+                                count_u8_with_skip_take(&data, &check_ops, skip, take)
                             });
                             return Ok(n > 0);
                         }
@@ -1047,7 +1107,9 @@ impl PyQuery {
                 }
                 Ok(false)
             }
-            QueryInner::ObjField { .. } | QueryInner::ObjFieldPy { .. } => {
+            QueryInner::ObjField { .. }
+            | QueryInner::ObjFieldPy { .. }
+            | QueryInner::ColumnarObj { .. } => {
                 let list = self.to_list(py)?;
                 for item in list.bind(py).iter() {
                     if pred.call1((item,))?.is_truthy()? {
@@ -1076,15 +1138,15 @@ impl PyQuery {
                                     let mut filter_ops = base_ops.clone();
                                     filter_ops.push(op);
                                     (
-                                        count_fused_f64_bounded(&data, &base_ops, 0, None),
-                                        count_fused_f64_bounded(&data, &filter_ops, 0, None),
+                                        count_fused_f64_with_skip_take(&data, &base_ops, 0, None),
+                                        count_fused_f64_with_skip_take(&data, &filter_ops, 0, None),
                                     )
                                 } else {
                                     let bounded =
-                                        execute_fused_f64_bounded(&data, &base_ops, skip, take);
+                                        execute_fused_f64_with_skip_take(&data, &base_ops, skip, take);
                                     (
                                         bounded.len(),
-                                        count_fused_f64_bounded(&bounded, &[op], 0, None),
+                                        count_fused_f64_with_skip_take(&bounded, &[op], 0, None),
                                     )
                                 }
                             });
@@ -1114,15 +1176,15 @@ impl PyQuery {
                                     let mut filter_ops = base_ops.clone();
                                     filter_ops.push(op);
                                     (
-                                        count_fused_i64_bounded(&data, &base_ops, 0, None),
-                                        count_fused_i64_bounded(&data, &filter_ops, 0, None),
+                                        count_fused_i64_with_skip_take(&data, &base_ops, 0, None),
+                                        count_fused_i64_with_skip_take(&data, &filter_ops, 0, None),
                                     )
                                 } else {
                                     let bounded =
-                                        execute_fused_i64_bounded(&data, &base_ops, skip, take);
+                                        execute_fused_i64_with_skip_take(&data, &base_ops, skip, take);
                                     (
                                         bounded.len(),
-                                        count_fused_i64_bounded(&bounded, &[op], 0, None),
+                                        count_fused_i64_with_skip_take(&bounded, &[op], 0, None),
                                     )
                                 }
                             });
@@ -1149,8 +1211,8 @@ impl PyQuery {
                             let (skip, take) = (self.skip, self.take);
                             let (total, matching) = py.allow_threads(move || {
                                 (
-                                    count_u8_bounded(&data, &base_ops, skip, take),
-                                    count_u8_bounded(&data, &check_ops, skip, take),
+                                    count_u8_with_skip_take(&data, &base_ops, skip, take),
+                                    count_u8_with_skip_take(&data, &check_ops, skip, take),
                                 )
                             });
                             return Ok(total == matching);
@@ -1264,7 +1326,9 @@ impl PyQuery {
                 }
                 Ok(true)
             }
-            QueryInner::ObjField { .. } | QueryInner::ObjFieldPy { .. } => {
+            QueryInner::ObjField { .. }
+            | QueryInner::ObjFieldPy { .. }
+            | QueryInner::ColumnarObj { .. } => {
                 let list = self.to_list(py)?;
                 for item in list.bind(py).iter() {
                     if !pred.call1((item,))?.is_truthy()? {
@@ -1309,6 +1373,9 @@ impl PyQuery {
             QueryInner::LazyFloatList { .. } => "lazy_f64_list",
             QueryInner::NumpyF64 { .. } => "numpy_f64",
             QueryInner::NumpyF32 { .. } => "numpy_f32",
+            QueryInner::ColumnarObj { ops, .. } => {
+                if ops.is_empty() { "columnar_obj" } else { "columnar_obj(lazy)" }
+            }
             QueryInner::Empty => "empty",
         };
         format!(
@@ -1449,6 +1516,27 @@ impl PyQuery {
                     self.parallel
                 );
             }
+            QueryInner::ColumnarObj { ops, data } => {
+                let ops_repr = if ops.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ops.iter()
+                        .map(|o| format!("{o:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                };
+                let kind_str = format!(
+                    "columnar_obj ({} cols, {} rows)",
+                    data.columns.len(),
+                    data.len
+                );
+                return format!(
+                    "Query.explain()\n  kind:     {kind_str}\n  ops:      {ops_repr}\n  skip:     {}\n  take:     {}\n  parallel: {}\n  gil_free: partial (filter free, collect GIL)\n  alloc:    1 Vec<usize> at terminal",
+                    self.skip,
+                    match self.take { Some(n) => format!("{n}"), None => "∞".to_string() },
+                    self.parallel
+                );
+            }
             QueryInner::Py(items) => (
                 "py (materialized)",
                 false,
@@ -1546,5 +1634,80 @@ impl PyQuery {
         }
 
         agg_build_result(py, keys, accs, &names, &kinds)
+    }
+
+    // -----------------------------------------------------------------------
+    // Rolling window aggregates (spec 084 T6)
+    // -----------------------------------------------------------------------
+
+    /// Sliding-window sum over numeric data.
+    ///
+    /// Produces `len(data) - window + 1` values.  Uses an O(N) running-sum
+    /// (add incoming, subtract outgoing) — no repeated summation per window.
+    ///
+    /// Only available on F64 / LazyFloatList / NumpyF64 paths.
+    /// Returns ``None`` on non-numeric paths (Python layer falls back to window().map()).
+    fn _rolling_sum_rust(&self, py: Python<'_>, window: usize) -> PyResult<PyObject> {
+        if window < 1 {
+            return Err(PyValueError::new_err("rolling_sum window must be >= 1"));
+        }
+        let Some(data) = self.collect_f64_for_rolling(py)? else {
+            return Ok(py.None());
+        };
+        if data.len() < window {
+            return Ok(PyQuery::from_inner(QueryInner::F64(NumericPipeline::new(vec![]))).into_py(py));
+        }
+        let mut sum: f64 = data[..window].iter().sum();
+        let mut out = Vec::with_capacity(data.len() - window + 1);
+        out.push(sum);
+        for i in window..data.len() {
+            sum += data[i] - data[i - window];
+            out.push(sum);
+        }
+        Ok(PyQuery::from_inner(QueryInner::F64(NumericPipeline::new(out))).into_py(py))
+    }
+
+    /// Sliding-window mean over numeric data.
+    ///
+    /// Equivalent to `rolling_sum(window) / window` but computed in a single O(N) pass.
+    fn _rolling_mean_rust(&self, py: Python<'_>, window: usize) -> PyResult<PyObject> {
+        if window < 1 {
+            return Err(PyValueError::new_err("rolling_mean window must be >= 1"));
+        }
+        let Some(data) = self.collect_f64_for_rolling(py)? else {
+            return Ok(py.None());
+        };
+        if data.len() < window {
+            return Ok(PyQuery::from_inner(QueryInner::F64(NumericPipeline::new(vec![]))).into_py(py));
+        }
+        let w = window as f64;
+        let mut sum: f64 = data[..window].iter().sum();
+        let mut out = Vec::with_capacity(data.len() - window + 1);
+        out.push(sum / w);
+        for i in window..data.len() {
+            sum += data[i] - data[i - window];
+            out.push(sum / w);
+        }
+        Ok(PyQuery::from_inner(QueryInner::F64(NumericPipeline::new(out))).into_py(py))
+    }
+
+    /// Materialise the pipeline to `Vec<f64>` for rolling operations.
+    /// Returns `None` when the path is not F64-compatible.
+    fn collect_f64_for_rolling(&self, py: Python<'_>) -> PyResult<Option<Vec<f64>>> {
+        match &self.inner {
+            QueryInner::F64(p) => {
+                let data = p.arc();
+                let ops = p.clone_ops();
+                Ok(Some(execute_fused_f64_with_skip_take(&data, &ops, self.skip, self.take)))
+            }
+            QueryInner::LazyFloatList { source, ops } => {
+                let ptr = source.as_ptr();
+                Ok(Some(execute_lazy_float_list(py, ptr, ops, self.skip, self.take)))
+            }
+            QueryInner::NumpyF64 { source, ops } => {
+                Ok(Some(execute_numpy_f64(py, source, ops, self.skip, self.take)?))
+            }
+            _ => Ok(None),
+        }
     }
 }

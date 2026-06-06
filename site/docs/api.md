@@ -136,6 +136,9 @@ Query(["a", "b", "a", "c", "a"]).value_counts()
 | `.unzip()` | Split `(a, b)` tuples into `([a…], [b…])` — useful after `inner_join` / `zip` |
 | `.median()` | Median value, or `None` if empty (materialises to sort) |
 | `.product()` | Product of all elements (1 for empty pipeline) |
+| `.count_if(pred)` | Count elements satisfying `pred` in a single pass |
+| `.sum_by(fn)` | Sum of `fn(item)` over all elements in a single pass |
+| `.mean_by(fn)` | Mean of `fn(item)`; `None` if empty (single pass) |
 
 ```python
 # filter_map: parse integers, skip non-numeric strings
@@ -159,8 +162,7 @@ users, orders = Query(users).inner_join(orders, "id").unzip()
 |---|---|
 | `.to_list()` | Collect to `list` |
 | `.to_dict(key, value)` | Collect to `dict` using `key(item)` and `value(item)` callables |
-| `.to_numpy()` | Collect to numpy `ndarray` (no per-element boxing; f64/i64/u8 only) |
-| `.to_bytes()` | Collect numeric pipeline to raw `bytes` (little-endian) |
+| `.to_bytes()` | Collect numeric pipeline to raw `bytes` (little-endian; use `np.frombuffer()` to get ndarray) |
 | `.count()` | Count matching elements |
 | `.sum()` | Sum (SIMD for numeric) |
 | `.mean()` | Arithmetic mean, or `None` if empty (single SIMD pass for f64 + filter) |
@@ -174,9 +176,37 @@ users, orders = Query(users).inner_join(orders, "id").unzip()
 | `.partition(pred)` | `(matching_list, non_matching_list)` in one pass (callable / `FieldExpr`) |
 | `.reduce(fn, initial)` | General left fold |
 | `.for_each(fn)` | Consume for side effects |
+| `.find(pred)` | First element matching `pred`, or `None` (short-circuits) |
 | `.any(pred)` | True if any element matches (short-circuits) |
 | `.all(pred)` | True if all elements match (short-circuits) |
 | `.explain()` | Human-readable pipeline description |
+
+### NumPy interop
+
+ZPyFlow does not depend on numpy.  The recommended patterns:
+
+**Input** — wrap a numpy array as a Query:
+
+```python
+from zpyflow import from_numpy
+import numpy as np
+
+arr = np.array([1.0, 2.0, 3.0, 4.0])
+result = from_numpy(arr).filter(col > 2.0).to_list()  # [3.0, 4.0]
+```
+
+**Output (f64 fast path)** — raw-byte transfer, no per-element boxing:
+
+```python
+raw = Query(data).filter(col > 0).to_bytes()   # little-endian f64 bytes
+arr = np.frombuffer(raw).copy()                 # writable float64 ndarray
+```
+
+**Output (general)** — for non-numeric or mixed pipelines:
+
+```python
+arr = np.array(Query(data).filter(...).to_list())
+```
 
 ---
 

@@ -79,7 +79,7 @@ enum FilterKind {
     Between(f64, f64),
 }
 
-fn single_filter_kind(ops: &[NumericOp]) -> Option<FilterKind> {
+fn detect_sole_filter_kind(ops: &[NumericOp]) -> Option<FilterKind> {
     if ops.len() != 1 {
         return None;
     }
@@ -93,7 +93,7 @@ fn single_filter_kind(ops: &[NumericOp]) -> Option<FilterKind> {
     }
 }
 
-fn is_filter_only_f64(ops: &[NumericOp]) -> bool {
+fn ops_are_filters_only(ops: &[NumericOp]) -> bool {
     ops.iter().all(|op| {
         matches!(
             op,
@@ -112,7 +112,7 @@ fn is_filter_only_f64(ops: &[NumericOp]) -> bool {
     })
 }
 
-fn filter_stats_simd_f64(data: &[f64], kind: FilterKind) -> Option<(usize, f64, f64, f64)> {
+fn compute_stats_single_filter_simd_f64(data: &[f64], kind: FilterKind) -> Option<(usize, f64, f64, f64)> {
     match kind {
         FilterKind::Gt(t) => simd::simd_filter_stats_gt(data, t),
         FilterKind::Ge(t) => simd::simd_filter_stats_ge(data, t),
@@ -163,14 +163,43 @@ impl NumericPipeline {
 
     /// Append one op — the only mutation; data is never touched.
     ///
-    /// Consecutive scalar maps of the same kind are folded in-place:
-    /// `MapMulScalar(2) + MapMulScalar(3)` → `MapMulScalar(6)`.
+    /// Adjacent ops of compatible kinds are merged in-place at build time:
+    /// - Scalar maps: `MapMulScalar(2) + MapMulScalar(3)` → `MapMulScalar(6)`
+    /// - Same-side filters: `FilterGt(5) + FilterGt(10)` → `FilterGt(10)` (tighter wins)
+    /// - Opposing bounds: `FilterGe(lo) + FilterLe(hi)` → `FilterBetween(lo, hi)`
+    /// - Idempotent flags: `FilterNotNan + FilterNotNan` → `FilterNotNan`
+    ///
+    /// Merges are only attempted when the last op and the new op are both filters
+    /// (or both maps of the same kind), so map→filter and filter→map sequences
+    /// are never incorrectly fused.
     pub fn push_op(mut self, op: NumericOp) -> Self {
+        use NumericOp::*;
         let folded = match (self.ops.last_mut(), &op) {
-            (Some(NumericOp::MapMulScalar(a)), NumericOp::MapMulScalar(b)) => { *a *= b; true }
-            (Some(NumericOp::MapAddScalar(a)), NumericOp::MapAddScalar(b)) => { *a += b; true }
-            (Some(NumericOp::MapSubScalar(a)), NumericOp::MapSubScalar(b)) => { *a += b; true }
-            (Some(NumericOp::MapDivScalar(a)), NumericOp::MapDivScalar(b)) => { *a *= b; true }
+            // Scalar map folding (existing)
+            (Some(MapMulScalar(a)), MapMulScalar(b)) => { *a *= b; true }
+            (Some(MapAddScalar(a)), MapAddScalar(b)) => { *a += b; true }
+            (Some(MapSubScalar(a)), MapSubScalar(b)) => { *a += b; true }
+            (Some(MapDivScalar(a)), MapDivScalar(b)) => { *a *= b; true }
+            // Same-side tightening: keep the stricter bound
+            (Some(FilterGt(a)), FilterGt(b)) => { *a = a.max(*b); true }
+            (Some(FilterGe(a)), FilterGe(b)) => { *a = a.max(*b); true }
+            (Some(FilterLt(a)), FilterLt(b)) => { *a = a.min(*b); true }
+            (Some(FilterLe(a)), FilterLe(b)) => { *a = a.min(*b); true }
+            // Opposing bounds: Ge(lo) + Le(hi) → Between(lo, hi)
+            // Between semantics: lo <= x <= hi; when lo > hi no element passes (correct empty).
+            (Some(last @ FilterGe(_)), FilterLe(hi)) => {
+                if let FilterGe(lo) = last { *last = FilterBetween(*lo, *hi); }
+                true
+            }
+            (Some(last @ FilterLe(_)), FilterGe(lo)) => {
+                if let FilterLe(hi) = last { *last = FilterBetween(*lo, *hi); }
+                true
+            }
+            // Idempotent flags
+            (Some(FilterNotNan), FilterNotNan) => true,
+            (Some(FilterNan),    FilterNan)    => true,
+            (Some(FilterFinite), FilterFinite) => true,
+            (Some(FilterInf),    FilterInf)    => true,
             _ => false,
         };
         if !folded {
@@ -207,19 +236,19 @@ impl NumericPipeline {
 
     #[cfg(feature = "parallel")]
     pub fn execute_parallel(self) -> Vec<f64> {
-        let (out_skip, out_take) = split_f64_bounds(&self.ops);
-        self.execute_parallel_bounded(out_skip, out_take)
+        let (out_skip, out_take) = extract_skip_take_from_ops(&self.ops);
+        self.execute_parallel_with_skip_take(out_skip, out_take)
     }
 
     #[cfg(feature = "parallel")]
-    pub fn execute_parallel_bounded(self, out_skip: usize, out_take: Option<usize>) -> Vec<f64> {
+    pub fn execute_parallel_with_skip_take(self, out_skip: usize, out_take: Option<usize>) -> Vec<f64> {
         use rayon::prelude::*;
 
         let ops = Arc::new(self.ops); // share ops across rayon threads
         let data = self.data; // Arc pointer clone, not data clone
 
-        if !has_filter_f64(ops.as_ref()) {
-            let (start, end) = slice_bounds(data.len(), out_skip, out_take);
+        if !ops_contain_filter(ops.as_ref()) {
+            let (start, end) = compute_output_slice_range(data.len(), out_skip, out_take);
             return data[start..end]
                 .par_iter()
                 .copied()
@@ -267,19 +296,19 @@ impl NumericPipeline {
 
 /// Accumulate a new `Take(n)` into the current minimum.
 #[inline]
-fn merge_take(current: Option<usize>, n: usize) -> Option<usize> {
+fn combine_take_bounds(current: Option<usize>, n: usize) -> Option<usize> {
     Some(current.map_or(n, |prev| prev.min(n)))
 }
 
 /// Scan f64 ops for Skip/Take bounds — O(ops) time, zero allocation.
 /// Skip/Take remain in the ops slice; the hot loop treats them as neutral.
-fn split_f64_bounds(ops: &[NumericOp]) -> (usize, Option<usize>) {
+fn extract_skip_take_from_ops(ops: &[NumericOp]) -> (usize, Option<usize>) {
     let mut skip: usize = 0;
     let mut take: Option<usize> = None;
     for op in ops {
         match op {
             NumericOp::Skip(n) => skip += n,
-            NumericOp::Take(n) => take = merge_take(take, *n),
+            NumericOp::Take(n) => take = combine_take_bounds(take, *n),
             _ => {}
         }
     }
@@ -316,10 +345,10 @@ pub fn collapse_ops(ops: &[NumericOp]) -> Vec<NumericOp> {
 
 /// Pure Rust API path — ops may contain Skip/Take embedded by `push_op`.
 /// Bounds are extracted inline with zero allocation; ops are passed as-is to
-/// `execute_fused_f64_bounded`, where Skip/Take are handled as neutral ops.
+/// `execute_fused_f64_with_skip_take`, where Skip/Take are handled as neutral ops.
 pub fn execute_fused_f64(data: &[f64], ops: &[NumericOp]) -> Vec<f64> {
-    let (src_skip, out_take) = split_f64_bounds(ops);
-    execute_fused_f64_bounded(data, ops, src_skip, out_take)
+    let (src_skip, out_take) = extract_skip_take_from_ops(ops);
+    execute_fused_f64_with_skip_take(data, ops, src_skip, out_take)
 }
 
 /// Core execution kernel — used by both the Python and pure Rust paths.
@@ -328,7 +357,7 @@ pub fn execute_fused_f64(data: &[f64], ops: &[NumericOp]) -> Vec<f64> {
 /// `out_take` caps the output length.  Both bounds are output-level (applied
 /// after all filters/maps), matching the semantics of `.skip(n).take(m)` in
 /// a lazy pipeline where the user expects skip to follow any preceding filter.
-pub fn execute_fused_f64_bounded(
+pub fn execute_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -336,10 +365,10 @@ pub fn execute_fused_f64_bounded(
 ) -> Vec<f64> {
     // Pagination hot path: if no filter changes cardinality, apply skip/take
     // to the source slice before maps. This avoids scanning skipped items.
-    if !has_filter_f64(ops) {
-        let (start, end) = slice_bounds(data.len(), out_skip, out_take);
+    if !ops_contain_filter(ops) {
+        let (start, end) = compute_output_slice_range(data.len(), out_skip, out_take);
         let window = &data[start..end];
-        if can_use_simd_path(ops) {
+        if pipeline_is_simd_eligible(ops) {
             return simd::execute_simd_pipeline(window, ops);
         }
 
@@ -358,7 +387,7 @@ pub fn execute_fused_f64_bounded(
 
     // SIMD path: only when there is no take limit.
     // With take, the scalar path breaks early and is faster when take << data.len().
-    if can_use_simd_path(ops) && out_take.is_none() {
+    if pipeline_is_simd_eligible(ops) && out_take.is_none() {
         let mut result = simd::execute_simd_pipeline(data, ops);
         let start = out_skip.min(result.len());
         if start > 0 {
@@ -394,7 +423,7 @@ pub fn execute_fused_f64_bounded(
 
 /// Count elements that pass all ops — never allocates an output Vec.
 /// Uses SIMD for the common case of a single filter op with no skip/take.
-pub fn count_fused_f64_bounded(
+pub fn count_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -525,8 +554,8 @@ pub fn filter_multi_stat_f64(
     data: &[f64],
     ops: &[NumericOp],
 ) -> Option<(usize, f64, f64, f64)> {
-    if let Some(kind) = single_filter_kind(ops) {
-        return filter_stats_simd_f64(data, kind);
+    if let Some(kind) = detect_sole_filter_kind(ops) {
+        return compute_stats_single_filter_simd_f64(data, kind);
     }
 
     let mut count = 0usize;
@@ -559,13 +588,13 @@ pub fn filter_multi_stat_f64(
 ///
 /// Unlike `filter_multi_stat_f64`, this applies both filters and maps, and it
 /// honors output-level skip/take. It never materializes the filtered output.
-pub fn stats_fused_f64_bounded(
+pub fn stats_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
     out_take: Option<usize>,
 ) -> Option<(usize, f64, f64, f64)> {
-    if out_skip == 0 && out_take.is_none() && is_filter_only_f64(ops) {
+    if out_skip == 0 && out_take.is_none() && ops_are_filters_only(ops) {
         return filter_multi_stat_f64(data, ops);
     }
 
@@ -608,7 +637,7 @@ pub fn stats_fused_f64_bounded(
 }
 
 /// Fused bounded sum over the final pipeline values. Never allocates.
-pub fn sum_fused_f64_bounded(
+pub fn sum_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -622,13 +651,13 @@ pub fn sum_fused_f64_bounded(
             return simd::simd_sum_f64(data);
         }
     }
-    stats_fused_f64_bounded(data, ops, out_skip, out_take)
+    stats_fused_f64_with_skip_take(data, ops, out_skip, out_take)
         .map(|(_, sum, _, _)| sum)
         .unwrap_or(0.0)
 }
 
 /// Fused bounded mean over the final pipeline values. Never allocates.
-pub fn mean_fused_f64_bounded(
+pub fn mean_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -639,7 +668,7 @@ pub fn mean_fused_f64_bounded(
             return mean;
         }
     }
-    stats_fused_f64_bounded(data, ops, out_skip, out_take)
+    stats_fused_f64_with_skip_take(data, ops, out_skip, out_take)
         .map(|(count, sum, _, _)| sum / count as f64)
 }
 
@@ -647,7 +676,7 @@ pub fn mean_fused_f64_bounded(
 ///
 /// Uses two direct scans to match the existing mean-then-ssq behavior without
 /// materializing an intermediate Vec.
-pub fn var_fused_f64_bounded(
+pub fn var_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -658,7 +687,7 @@ pub fn var_fused_f64_bounded(
             return var;
         }
     }
-    let (count, sum, _, _) = stats_fused_f64_bounded(data, ops, out_skip, out_take)?;
+    let (count, sum, _, _) = stats_fused_f64_with_skip_take(data, ops, out_skip, out_take)?;
     let mean = sum / count as f64;
     let mut seen = 0usize;
     let mut skipped = 0usize;
@@ -688,7 +717,7 @@ pub fn var_fused_f64_bounded(
 }
 
 /// Fused bounded minimum over the final pipeline values. Never allocates.
-pub fn min_fused_f64_bounded(
+pub fn min_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -699,11 +728,11 @@ pub fn min_fused_f64_bounded(
             return min;
         }
     }
-    stats_fused_f64_bounded(data, ops, out_skip, out_take).map(|(_, _, min, _)| min)
+    stats_fused_f64_with_skip_take(data, ops, out_skip, out_take).map(|(_, _, min, _)| min)
 }
 
 /// Fused bounded maximum over the final pipeline values. Never allocates.
-pub fn max_fused_f64_bounded(
+pub fn max_fused_f64_with_skip_take(
     data: &[f64],
     ops: &[NumericOp],
     out_skip: usize,
@@ -717,12 +746,12 @@ pub fn max_fused_f64_bounded(
             return simd::simd_max_f64(data);
         }
     }
-    stats_fused_f64_bounded(data, ops, out_skip, out_take).map(|(_, _, _, max)| max)
+    stats_fused_f64_with_skip_take(data, ops, out_skip, out_take).map(|(_, _, _, max)| max)
 }
 
 /// Count variant for the i64 fast path.
 /// Uses SIMD for the common case of a single filter op with no skip/take.
-pub fn count_fused_i64_bounded(
+pub fn count_fused_i64_with_skip_take(
     data: &[i64],
     ops: &[IntOp],
     out_skip: usize,
@@ -857,7 +886,7 @@ pub(crate) fn apply_scalar_op(val: f64, op: &NumericOp) -> ScalarResult {
         NumericOp::MapClamp(lo, hi) => ScalarResult::Value(val.clamp(*lo, *hi)),
 
         // Skip/Take are bounds, not value transforms — pass the value through.
-        // Bounds are enforced by the loop in execute_fused_f64_bounded, not here.
+        // Bounds are enforced by the loop in execute_fused_f64_with_skip_take, not here.
         NumericOp::Take(_) | NumericOp::Skip(_) => ScalarResult::Value(val),
     }
 }
@@ -865,7 +894,7 @@ pub(crate) fn apply_scalar_op(val: f64, op: &NumericOp) -> ScalarResult {
 /// Returns true when all *value* ops are amenable to SIMD execution.
 /// Skip/Take are bounds, not value ops — they are treated as neutral here
 /// so their presence does not incorrectly disable the SIMD path.
-fn can_use_simd_path(ops: &[NumericOp]) -> bool {
+fn pipeline_is_simd_eligible(ops: &[NumericOp]) -> bool {
     ops.iter().all(|op| {
         matches!(
             op,
@@ -900,7 +929,7 @@ fn can_use_simd_path(ops: &[NumericOp]) -> bool {
     })
 }
 
-fn has_filter_f64(ops: &[NumericOp]) -> bool {
+fn ops_contain_filter(ops: &[NumericOp]) -> bool {
     ops.iter().any(|op| {
         matches!(
             op,
@@ -919,7 +948,7 @@ fn has_filter_f64(ops: &[NumericOp]) -> bool {
     })
 }
 
-fn slice_bounds(len: usize, skip: usize, take: Option<usize>) -> (usize, usize) {
+fn compute_output_slice_range(len: usize, skip: usize, take: Option<usize>) -> (usize, usize) {
     let start = skip.min(len);
     let remaining = len - start;
     let count = take.unwrap_or(remaining).min(remaining);
@@ -995,11 +1024,11 @@ pub(crate) fn apply_scalar_op_f32(val: f32, op: &NumericOp) -> ScalarResult32 {
     }
 }
 
-fn has_filter_f32(ops: &[NumericOp]) -> bool {
-    has_filter_f64(ops) // same predicate variants
+fn ops_contain_filter_f32(ops: &[NumericOp]) -> bool {
+    ops_contain_filter(ops) // same predicate variants
 }
 
-fn can_use_simd_f32_path(ops: &[NumericOp]) -> bool {
+fn pipeline_is_simd_f32_eligible(ops: &[NumericOp]) -> bool {
     ops.iter().all(|op| {
         matches!(
             op,
@@ -1021,17 +1050,17 @@ fn can_use_simd_f32_path(ops: &[NumericOp]) -> bool {
     })
 }
 
-/// Single-pass fused execution for f32 data (mirrors execute_fused_f64_bounded).
-pub fn execute_fused_f32_bounded(
+/// Single-pass fused execution for f32 data (mirrors execute_fused_f64_with_skip_take).
+pub fn execute_fused_f32_with_skip_take(
     data: &[f32],
     ops: &[NumericOp],
     out_skip: usize,
     out_take: Option<usize>,
 ) -> Vec<f32> {
-    if !has_filter_f32(ops) {
-        let (start, end) = slice_bounds(data.len(), out_skip, out_take);
+    if !ops_contain_filter_f32(ops) {
+        let (start, end) = compute_output_slice_range(data.len(), out_skip, out_take);
         let window = &data[start..end];
-        if can_use_simd_f32_path(ops) {
+        if pipeline_is_simd_f32_eligible(ops) {
             return simd::execute_simd_f32_pipeline(window, ops);
         }
         let mut out = Vec::with_capacity(window.len());
@@ -1047,7 +1076,7 @@ pub fn execute_fused_f32_bounded(
         return out;
     }
 
-    if can_use_simd_f32_path(ops) && out_take.is_none() {
+    if pipeline_is_simd_f32_eligible(ops) && out_take.is_none() {
         let mut result = simd::execute_simd_f32_pipeline(data, ops);
         let start = out_skip.min(result.len());
         if start > 0 {
@@ -1081,7 +1110,7 @@ pub fn execute_fused_f32_bounded(
 }
 
 /// Count elements passing all ops for f32 data.
-pub fn count_fused_f32_bounded(
+pub fn count_fused_f32_with_skip_take(
     data: &[f32],
     ops: &[NumericOp],
     out_skip: usize,
@@ -1167,8 +1196,22 @@ impl IntPipeline {
         self
     }
 
+    /// Same-side filter tightening, mirroring `NumericPipeline::push_op`.
     pub fn push_op(mut self, op: IntOp) -> Self {
-        self.ops.push(op);
+        use IntOp::*;
+        let folded = match (self.ops.last_mut(), &op) {
+            (Some(FilterGt(a)), FilterGt(b)) => { *a = (*a).max(*b); true }
+            (Some(FilterGe(a)), FilterGe(b)) => { *a = (*a).max(*b); true }
+            (Some(FilterLt(a)), FilterLt(b)) => { *a = (*a).min(*b); true }
+            (Some(FilterLe(a)), FilterLe(b)) => { *a = (*a).min(*b); true }
+            (Some(MapMulScalar(a)), MapMulScalar(b)) => { *a = a.saturating_mul(*b); true }
+            (Some(MapAddScalar(a)), MapAddScalar(b)) => { *a = a.saturating_add(*b); true }
+            (Some(MapSubScalar(a)), MapSubScalar(b)) => { *a = a.saturating_add(*b); true }
+            _ => false,
+        };
+        if !folded {
+            self.ops.push(op);
+        }
         self
     }
 
@@ -1184,29 +1227,29 @@ impl IntPipeline {
     /// Execute all ops in a single fused pass.
     /// Skip/Take embedded in ops are extracted before the loop (pure Rust API path).
     pub fn execute(self) -> Vec<i64> {
-        let (skip_count, take_count, value_ops) = split_int_bounds(self.ops);
-        execute_fused_i64_bounded(&self.data, &value_ops, skip_count, take_count)
+        let (skip_count, take_count, value_ops) = extract_skip_take_from_int_ops(self.ops);
+        execute_fused_i64_with_skip_take(&self.data, &value_ops, skip_count, take_count)
     }
 
     #[cfg(feature = "parallel")]
     pub fn execute_parallel(self) -> Vec<i64> {
-        let (skip_count, take_count, value_ops) = split_int_bounds(self.ops);
+        let (skip_count, take_count, value_ops) = extract_skip_take_from_int_ops(self.ops);
         IntPipeline {
             data: self.data,
             ops: value_ops,
         }
-        .execute_parallel_bounded(skip_count, take_count)
+        .execute_parallel_with_skip_take(skip_count, take_count)
     }
 
     #[cfg(feature = "parallel")]
-    pub fn execute_parallel_bounded(self, out_skip: usize, out_take: Option<usize>) -> Vec<i64> {
+    pub fn execute_parallel_with_skip_take(self, out_skip: usize, out_take: Option<usize>) -> Vec<i64> {
         use rayon::prelude::*;
 
         let ops = Arc::new(self.ops);
         let data = self.data;
 
         if !has_filter_i64(ops.as_ref()) {
-            let (start, end) = slice_bounds(data.len(), out_skip, out_take);
+            let (start, end) = compute_output_slice_range(data.len(), out_skip, out_take);
             return data[start..end]
                 .par_iter()
                 .copied()
@@ -1248,14 +1291,14 @@ impl IntPipeline {
     }
 }
 
-fn split_int_bounds(ops: Vec<IntOp>) -> (usize, Option<usize>, Vec<IntOp>) {
+fn extract_skip_take_from_int_ops(ops: Vec<IntOp>) -> (usize, Option<usize>, Vec<IntOp>) {
     let mut skip: usize = 0;
     let mut take: Option<usize> = None;
     let value_ops = ops
         .into_iter()
         .filter(|op| match op {
             IntOp::Take(n) => {
-                take = merge_take(take, *n);
+                take = combine_take_bounds(take, *n);
                 false
             }
             IntOp::Skip(n) => {
@@ -1269,7 +1312,7 @@ fn split_int_bounds(ops: Vec<IntOp>) -> (usize, Option<usize>, Vec<IntOp>) {
 }
 
 /// Python path: out_skip and out_take are output-level bounds — no Skip/Take in ops.
-pub fn execute_fused_i64_bounded(
+pub fn execute_fused_i64_with_skip_take(
     data: &[i64],
     ops: &[IntOp],
     out_skip: usize,
@@ -1278,7 +1321,7 @@ pub fn execute_fused_i64_bounded(
     // Pagination hot path: with no filters, skip/take can be applied before
     // integer maps because maps do not change cardinality.
     if !has_filter_i64(ops) {
-        let (start, end) = slice_bounds(data.len(), out_skip, out_take);
+        let (start, end) = compute_output_slice_range(data.len(), out_skip, out_take);
         let window = &data[start..end];
         let mut out = Vec::with_capacity(window.len());
         for &raw in window {
@@ -1566,7 +1609,7 @@ mod tests {
         ];
 
         for op in cases {
-            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            let values = execute_fused_f64_with_skip_take(&data, &[op.clone()], 0, None);
             let expected = if values.is_empty() {
                 None
             } else {
@@ -1589,9 +1632,9 @@ mod tests {
     }
 
     #[test]
-    fn f64_bounded_stats_falls_back_for_skip_take() {
+    fn f64_with_skip_take_stats_falls_back_for_skip_take() {
         let data = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let result = stats_fused_f64_bounded(&data, &[NumericOp::FilterGe(1.0)], 1, Some(2)).unwrap();
+        let result = stats_fused_f64_with_skip_take(&data, &[NumericOp::FilterGe(1.0)], 1, Some(2)).unwrap();
         assert_eq!(result, (2, 5.0, 2.0, 3.0));
     }
 
@@ -1607,9 +1650,9 @@ mod tests {
         ];
 
         for op in cases {
-            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            let values = execute_fused_f64_with_skip_take(&data, &[op.clone()], 0, None);
             assert_eq!(
-                count_fused_f64_bounded(&data, &[op], 0, None),
+                count_fused_f64_with_skip_take(&data, &[op], 0, None),
                 values.len()
             );
         }
@@ -1627,7 +1670,7 @@ mod tests {
         ];
 
         for op in cases {
-            let values = execute_fused_f64_bounded(&data, &[op.clone()], 0, None);
+            let values = execute_fused_f64_with_skip_take(&data, &[op.clone()], 0, None);
             let expected_sum = values.iter().sum::<f64>();
             let expected_mean = if values.is_empty() {
                 None

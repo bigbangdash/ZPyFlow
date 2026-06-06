@@ -1,5 +1,7 @@
 # Benchmark Results
 
+Last updated: 2026-06-06
+
 Raw JSON results are stored in
 [`sandbox/benchmark/results/`](../../sandbox/benchmark/results/)
 and updated after each `make dc-bench` run.
@@ -55,6 +57,30 @@ Representative results from the benchmark suite.
     For full-array numeric scans and multi-stat reports, NumPy and Polars are
     usually faster. Use ZPyFlow for early-stop pipelines, typed adapter paths,
     and Python-object workflows where the DSL avoids callbacks.
+
+### Web server throughput (FastAPI sync endpoint)
+
+*200,000 floats per request · 8 concurrent clients · 40 total requests*
+
+| Endpoint | RPS | Avg latency |
+|---|---|---|
+| `GET /python` (generator sum) | 143.6 | 52.1 ms |
+| `GET /zpyflow` (Expression DSL) | 309.5 | 24.8 ms |
+
+**2.16× RPS improvement** measured end-to-end over HTTP.
+
+The source of the gain is **per-request computation speed**: the SIMD-accelerated
+Rust kernel processes 200 k floats without constructing a Python object per element.
+Because each ZPyFlow request completes faster, FastAPI's thread pool threads are free
+sooner, which multiplies into higher RPS under concurrent load.
+
+GIL release is an additional benefit when multiple CPU cores are available, but it is
+not the primary driver. The same speedup appears in single-threaded workloads.
+
+!!! tip "What this means in practice"
+    If a sync endpoint runs a ZPyFlow numeric pipeline over a large sequence, expect
+    proportional RPS gains. The benefit shrinks when the pipeline is very short
+    (dispatch overhead dominates) or when the bottleneck is I/O rather than CPU.
 
 ---
 

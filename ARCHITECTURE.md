@@ -55,21 +55,22 @@ In Python/Rust, we cannot do this end-to-end (Python is dynamically typed), but 
 ┌────────────────────────▼────────────────────────────────────┐
 │  zpyflow Python layer  (zpyflow/__init__.py, adapters.py)   │
 │  - Data source normalization (numpy, arrow, generators)     │
+│  - Lambda AST → DSL conversion (_lambda_parser.py)         │
 │  - GroupBy (pure Python, hash-map based)                    │
-│  - Type stubs (.pyi) for IDE support                        │
+│  - Type stubs (__init__.pyi) for IDE support                │
 └────────────────────────┬────────────────────────────────────┘
                          │ PyO3 extension call
 ┌────────────────────────▼────────────────────────────────────┐
-│  PyO3 binding layer    (src/python/query.rs)                │
+│  PyO3 binding layer    (src/python/query/)                  │
 │  - PyQuery class — Python-visible, stores QueryInner        │
-│  - Dispatch: F64 path / I64 path / Py object path           │
-│  - PyExpr / ColProxy — expression DSL                       │
-│  - GIL release for numeric paths                            │
+│  - Dispatch: F64 / I64 / U8 / NumpyF64 / NumpyF32 / Obj …  │
+│  - PyExpr / FieldExpr / ColProxy — expression DSL           │
+│  - GIL release for numeric and numpy paths                  │
 └────────────┬───────────────────────────────┬────────────────┘
              │ NumericPipeline/IntPipeline   │ ZStream
 ┌────────────▼────────────┐  ┌──────────────▼───────────────┐
 │  Numeric fast path      │  │  Generic ZStream pipeline     │
-│  (src/pipeline/numeric) │  │  (src/pipeline/traits.rs)     │
+│  (src/core/numeric/)    │  │  (src/core/traits.rs)         │
 │  - Op queue (no alloc)  │  │  - Map, Filter, Take, etc.    │
 │  - Single-pass fusion   │  │  - SliceStream, VecStream     │
 │  - SIMD dispatch        │  │  - Zero dynamic dispatch      │
@@ -77,11 +78,12 @@ In Python/Rust, we cannot do this end-to-end (Python is dynamically typed), but 
              │
 ┌────────────▼────────────┐  ┌──────────────────────────────┐
 │  SIMD layer             │  │  Parallel layer               │
-│  (src/simd/mod.rs)      │  │  (src/parallel/mod.rs)        │
-│  - f64x4 / f32x8        │  │  - Rayon work-stealing        │
-│  - Filter with masking  │  │  - par_execute_f64/i64        │
-│  - In-place map ops     │  │  - Group-by parallelism       │
-│  - Dot product, sum     │  │  - GIL fully released         │
+│  (src/core/numeric/     │  │  (src/core/parallel.rs)       │
+│   simd.rs)              │  │  - Rayon work-stealing        │
+│  - f64x4 / f32x8        │  │  - par_execute_f64/i64        │
+│  - Filter with masking  │  │  - Group-by parallelism       │
+│  - In-place map ops     │  │  - GIL fully released         │
+│  - Dot product, sum     │  │                               │
 └─────────────────────────┘  └──────────────────────────────┘
 ```
 
@@ -130,9 +132,16 @@ pub struct PyQuery {
 }
 
 enum QueryInner {
-    F64(NumericPipeline),   // typed, GIL-free
-    I64(IntPipeline),       // typed, GIL-free
-    Py(Vec<PyObject>),      // generic, GIL required
+    F64(NumericPipeline),          // typed, GIL-free
+    I64(IntPipeline),              // typed, GIL-free
+    U8(U8Pipeline),                // bool/u8, GIL-free
+    Py(Vec<PyObject>),             // generic Python objects, GIL required
+    Obj(Box<dyn Iterator<...>>),   // Python iterator fallback
+    RustObj(Arc<Vec<RustValue>>),  // owned Rust values for ObjField path
+    LazyFloatList(ChunkedF64),     // chunked f64 for partial computation
+    NumpyF64(Arc<[f64]>),          // borrowed via buffer protocol (zero-copy)
+    NumpyF32(Arc<[f32]>),          // borrowed via buffer protocol (zero-copy)
+    ObjField { ... },              // field()-DSL over dict/dataclass objects
     Empty,
 }
 ```
@@ -221,28 +230,27 @@ Each element costs: 1 Python float allocation + 1 Python call + 1 bool read. Thi
 - We avoid Python's frame creation overhead (no `yield`)
 - The Rust loop itself has less overhead than Python bytecode dispatch
 
-### 5.3 Zero-copy opportunities
+### 5.3 Zero-copy numpy inputs
 
-For numpy arrays, `from_numpy()` currently calls `.tolist()` which copies once. A future version can use PyO3's `PyReadonlyArray<f64>` to borrow the numpy buffer directly:
+For numpy arrays, `from_numpy()` uses PyO3's buffer protocol to borrow the numpy buffer directly — no `.tolist()` copy:
 
 ```rust
-// Future zero-copy numpy path:
-let arr: PyReadonlyArray1<f64> = data.extract()?;
-let slice = arr.as_slice()?;  // zero-copy borrow of numpy memory
-// Process via SliceStream::new(slice) — no clone!
+// Implemented via buffer protocol:
+let view = data.call_method0(py, "__array_interface__")?;
+// or: PyReadonlyArray1<f64> via pyo3-numpy — zero-copy borrow of numpy memory
+// Pipeline operates on Arc<[f64]> pointing into the original array's memory.
 ```
 
-This eliminates the one remaining allocation. Safe because the query is executed synchronously before the array is released.
+The query is executed synchronously before the Python array can be released, so the borrow is safe. This eliminates any allocation for the input stage on the numpy path.
 
 ### 5.4 Python callback overhead mitigation strategies
 
-| Strategy             | Mechanism                                      | Status  |
-|----------------------|------------------------------------------------|---------|
-| Expression DSL       | `col > 5` → `NumericOp::FilterGt(5.0)` in Rust | ✅ MVP  |
-| Batched callbacks    | Call Python with chunks, not single elements   | Roadmap |
-| Numba JIT            | Accept `@jit`-compiled functions as fast paths | Roadmap |
-| Expression bytecode  | Parse simple lambda ASTs into NumericOps       | Roadmap |
-| Cython callbacks     | Accept C function pointers from Cython/ctypes  | Roadmap |
+| Strategy             | Mechanism                                      | Status      |
+|----------------------|------------------------------------------------|-------------|
+| Expression DSL       | `col > 5` → `NumericOp::FilterGt(5.0)` in Rust | ✅ Done    |
+| Expression bytecode  | Parse simple lambda ASTs into NumericOps       | ✅ Done (`_lambda_parser.py`) |
+| Batched callbacks    | Call Python with chunks, not single elements   | Spec 080    |
+| Cython callbacks     | Accept C function pointers from Cython/ctypes  | Backlog     |
 
 ---
 
@@ -286,55 +294,49 @@ For 1M f64 elements, `filter(x > 0.5) + map(x * 2) + take(10_000)`:
 
 ---
 
-## 7. Query Optimization Ideas (Roadmap)
+## 7. Query Optimization
 
-### 7.1 Predicate pushdown (Phase 2)
+### 7.1 Predicate pushdown
 
-When multiple filters are chained, collect them into a single compound predicate evaluated in one pass. Currently each `.filter()` creates a new `NumericPipeline` with an appended op — this already achieves the same effect. For the Py path, predicate pushdown would avoid re-scanning items.
+When multiple filters are chained, each `.filter()` appends a `NumericOp` to the pipeline's op queue. All ops are evaluated in a single fused pass at terminal execution — no intermediate `Vec` is created. For the Python object path, predicates are applied element-by-element inside one Rust loop.
 
-### 7.2 Operation collapsing (Phase 2)
+### 7.2 Operation collapsing ✅
 
-Consecutive map scalars can be collapsed:
+Consecutive map scalars are collapsed at op-push time:
 
 ```
-MapMulScalar(2.0) + MapMulScalar(3.0) → MapMulScalar(6.0)
-MapAddScalar(1.0) + MapAddScalar(2.0) → MapAddScalar(3.0)
+MapMulScalar(2.0) → MapMulScalar(3.0)  collapses to  MapMulScalar(6.0)
+MapAddScalar(1.0) → MapAddScalar(2.0)  collapses to  MapAddScalar(3.0)
 ```
 
-This reduces loop iterations in the SIMD path.
+This reduces loop iterations in the SIMD path with zero runtime overhead.
 
-### 7.3 Python lambda AST analysis (Phase 3)
+### 7.3 Lambda AST → DSL conversion ✅
 
-For simple lambdas like `lambda x: x > 5`, we can inspect `f.__code__.co_consts` and `co_code` to detect patterns and convert them to Expr DSL automatically:
+For simple lambdas like `lambda x: x > 5`, `_lambda_parser.py` inspects `f.__code__` bytecode and converts them to Expr DSL automatically before the pipeline reaches Rust:
 
 ```python
-def lambda_to_expr(f):
-    import dis
-    instructions = list(dis.get_instructions(f))
-    # Pattern: LOAD_FAST → LOAD_CONST → COMPARE_OP → RETURN_VALUE
-    if len(instructions) == 4:
-        if instructions[2].opname == 'COMPARE_OP':
-            threshold = instructions[1].argval
-            op = instructions[2].argval
-            return ExprOp from (op, threshold)
-    return None  # Fall back to Python callback
+# User writes:
+Query(data).filter(lambda x: x > 5)
+# _lambda_parser detects LOAD_FAST → LOAD_CONST → COMPARE_OP pattern
+# Converted to:  Query(data).filter(col > 5)   — GIL-free Rust path
 ```
 
-### 7.4 JIT via Cranelift / LLVM (Phase 4)
+Falls back to the Python callback path for complex lambdas that can't be decoded.
 
-For complex numeric pipelines, generate Cranelift IR at query-construction time and JIT-compile the entire pipeline to native code. This would achieve ZLinq-equivalent performance for arbitrary expressions.
+### 7.4 Batched Python callbacks (Spec 080)
 
-### 7.5 Batched Python callbacks (Phase 3)
-
-Instead of calling Python once per element, call it once per chunk (e.g., 256 elements). The Python function receives a list and returns a list. This reduces GIL acquisition overhead by 256×:
+For lambdas that can't be converted to DSL, call Python once per chunk rather than once per element. This reduces GIL acquisition overhead proportionally to chunk size:
 
 ```python
 # Current: called N times
 .filter(lambda x: x > threshold)
 
-# Future: called N/256 times
-.filter_batch(lambda chunk: [x for x in chunk if x > threshold])
+# Spec 080 target: called N/256 times
+# chunk: numpy array of 256 elements passed at once
 ```
+
+See [spec 080](specs/080-query-optimizer/tasks.md).
 
 ---
 
@@ -358,17 +360,7 @@ results = (
 )
 ```
 
-### 8.2 Streaming inference / event processing
-
-Rust `async` streams (tokio) can feed `ZPyFlow` pipelines:
-
-```
-Kafka consumer → tokio channel → ZPyFlow pipeline → Python handler
-```
-
-The pipeline stage runs in Rust with zero GIL contention; only the Python handler at the end acquires the GIL.
-
-### 8.3 ETL pipelines
+### 8.2 ETL pipelines
 
 ```python
 (
@@ -380,7 +372,7 @@ The pipeline stage runs in Rust with zero GIL contention; only the Python handle
 )
 ```
 
-### 8.4 Why "Python frontend + Rust core" matters
+### 8.3 Why "Python frontend + Rust core" matters
 
 The ML/data ecosystem is already Python-first. Rewriting user code in Rust is not viable. But:
 
@@ -395,47 +387,67 @@ The ML/data ecosystem is already Python-first. Rewriting user code in Rust is no
 
 ```
 src/
-├── lib.rs                  # PyO3 module entry point
-├── pipeline/
-│   ├── mod.rs              # Re-exports
-│   ├── traits.rs           # ZStream trait + all operator structs
-│   │                         Map, Filter, Take, Skip, Zip, Chain,
-│   │                         FlatMap, Enumerate, TakeWhile, SkipWhile
-│   ├── sources.rs          # SliceStream, SliceRefStream, VecStream,
-│   │                         RangeStream, RepeatN, Once, ChunkedStream
-│   └── numeric.rs          # NumericPipeline, NumericOp, IntPipeline, IntOp
-├── simd/
-│   └── mod.rs              # f64x4/f32x8 operations: filter, map, sum, dot
-├── parallel/
-│   └── mod.rs              # Rayon-based parallel execution
+├── lib.rs                        # PyO3 module entry point, registers all classes
+├── core/
+│   ├── mod.rs
+│   ├── traits.rs                 # ZStream trait + operator structs (Map, Filter, Take …)
+│   ├── sources.rs                # SliceStream, VecStream, RangeStream, RepeatN …
+│   ├── parallel.rs               # Rayon par_execute_f64/i64, group-by parallelism
+│   ├── numeric/
+│   │   ├── mod.rs
+│   │   ├── pipeline.rs           # NumericPipeline (f64), IntPipeline (i64), U8Pipeline
+│   │   └── simd.rs               # f64x4/f32x8: filter-mask, map, sum, dot product
+│   └── obj/
+│       ├── mod.rs
+│       └── pipeline.rs           # RustValue, ObjField pipeline for dict/dataclass path
+├── io/
+│   ├── mod.rs
+│   ├── csv.rs                    # from_csv — Rust CSV reader → Vec<RustValue>
+│   └── jsonl.rs                  # from_json_lines — line-by-line JSON parser
 └── python/
-    ├── mod.rs
-    └── query.rs            # PyQuery, PyExpr, PyColProxy (PyO3 classes)
+    ├── mod.rs                    # Registers all Python-visible types
+    ├── expr.rs                   # PyExpr, ColProxy, FieldExpr (DSL objects)
+    ├── agg.rs                    # Aggregation kernels: sum_by, mean_by, count_by …
+    ├── conversion.rs             # Python ↔ Rust type bridges
+    ├── fastpath.rs               # Fused terminal reductions (sum+count in one pass)
+    ├── io_bridge.rs              # Python-facing I/O wrappers (from_csv, from_arrow)
+    └── query/
+        ├── mod.rs                # PyQuery class, QueryInner enum
+        ├── construct.rs          # Query construction: from list/numpy/arrow/generator
+        ├── filter.rs             # .filter(), .take_while(), .skip_while()
+        ├── map_ops.rs            # .map(), .flat_map(), .enumerate()
+        ├── transform.rs          # .skip(), .take(), .zip(), .chain(), .tee() …
+        └── terminal.rs           # .to_list(), .sum(), .count(), .reduce() …
 
 zpyflow/
-├── __init__.py             # Public API surface
-├── adapters.py             # from_numpy, from_arrow, from_csv, from_json_lines
-├── groupby.py              # GroupBy (pure Python, hash-map)
-└── _types.pyi              # Type stubs for mypy / IDE
+├── __init__.py                   # Public API: Query, col, field, from_* functions
+├── __init__.pyi                  # Type stubs for mypy / IDE
+├── _lambda_parser.py             # Lambda AST → DSL conversion
+├── adapters.py                   # from_numpy, from_arrow, from_csv, from_json_lines
+└── groupby.py                    # GroupBy (pure Python, hash-map based)
 
 benches/
-├── pipeline.rs             # Criterion benchmarks: filter, map, chain, SIMD
-└── simd_filter.rs          # SIMD selectivity analysis
+├── pipeline.rs                   # Criterion benchmarks: filter, map, chain, SIMD
+└── simd_filter.rs                # SIMD selectivity analysis (10%…90%)
 
 tests/
-├── test_basic.py           # Unit tests: correctness, edge cases
-└── test_performance.py     # Performance regression tests
+├── test_numeric.py               # f64/i64/u8 pipeline correctness
+├── test_objects.py               # dict/dataclass, field() DSL
+├── test_transforms.py            # map, flat_map, zip, chain, enumerate …
+├── test_groupby.py               # group_by, sum_by, mean_by, count_by
+├── test_io.py                    # from_csv, from_json_lines
+├── test_misc.py                  # infinite sequences, edge cases
+├── test_api_exports.py           # public API surface stability
+└── test_performance.py           # regression guards (N=10K, not benchmark)
 ```
 
 ---
 
 ## 10. Risks and Tradeoffs
 
-### 10.1 The clone problem
+### 10.1 The clone problem ✅
 
-`NumericPipeline::execute()` currently clones `data` before executing because the Python API requires the `Query` object to be immutable (calling `.filter()` should not consume the original). This one clone (O(N)) is the dominant allocation cost.
-
-**Mitigation**: use `Arc<Vec<f64>>` for shared ownership, clone only when a new branch is created. Most linear pipelines won't clone at all.
+`NumericPipeline` uses `Arc<Vec<f64>>` for shared ownership. The Python-visible `Query` object is immutable; each chained operator returns a new `Query` that shares the input `Arc` without copying. A real copy only occurs when the data must be mutated in-place, which is rare (in-place scalar ops on borrowed data). Most linear pipelines have zero clones of the data.
 
 ### 10.2 Python lambda overhead
 
@@ -443,9 +455,7 @@ When users pass Python lambdas to `.filter()` or `.map()`, performance is constr
 - Expr DSL path: ~2ms
 - Python lambda path: ~80ms (same as pure Python)
 
-The expression DSL is the answer, but it requires users to use `col > 5` syntax instead of `lambda x: x > 5`. This is a learning curve.
-
-**Mitigation**: automatically detect simple lambdas (AST analysis) and convert to Expr. This is in the roadmap.
+**Mitigation implemented**: `_lambda_parser.py` inspects `f.__code__` bytecode and converts simple patterns (`lambda x: x > 5`, `lambda x: x * 2`, etc.) to Expr DSL automatically before the call reaches Rust. Complex lambdas fall back to the Python callback path. Residual gap for unconvertible lambdas is tracked in Spec 080 (batched callbacks).
 
 ### 10.3 Type detection at construction
 
@@ -459,53 +469,7 @@ The expression DSL is the answer, but it requires users to use `col > 5` syntax 
 
 ---
 
-## 11. Phased Implementation Roadmap
-
-### Phase 1 — MVP (current)
-
-- [x] `ZStream` trait + all basic operators
-- [x] `SliceStream`, `VecStream`, `RangeStream` sources
-- [x] `NumericPipeline` (f64) with `NumericOp` DSL
-- [x] `IntPipeline` (i64)
-- [x] SIMD: `f64x4` filter and map operations
-- [x] SIMD: dot product, sum, max
-- [x] Parallel execution via Rayon
-- [x] PyO3 `PyQuery` class with GIL release
-- [x] Expression DSL (`col > 5`, `col * 2`, etc.)
-- [x] Python adapters: numpy, arrow, CSV, JSON Lines
-- [x] `GroupBy` (pure Python)
-- [x] Type stubs (`.pyi`)
-- [x] Criterion benchmark suite
-- [x] pytest test suite
-
-### Phase 2 — Performance hardening
-
-- [ ] Zero-copy numpy path via `PyReadonlyArray<f64>`
-- [ ] Arc-based pipeline sharing (eliminate clone)
-- [ ] Operation collapsing (MapMul + MapMul → MapMul)
-- [ ] f32 fast path (ML embeddings are typically f32)
-- [ ] Chunked/streaming CSV source (no full materialization)
-- [ ] Async stream source (tokio channel bridge)
-
-### Phase 3 — Optimizer
-
-- [ ] Lambda AST analysis → automatic Expr conversion
-- [ ] Batched Python callbacks (chunk-level GIL acquisition)
-- [ ] Predicate reordering (cheapest filter first)
-- [ ] Numba `@jit` integration
-- [ ] Arrow IPC zero-copy reader
-
-### Phase 4 — Advanced
-
-- [ ] JIT compilation via Cranelift
-- [ ] Query plan visualization (`Query.explain()`)
-- [ ] Distributed execution (partitioned across processes)
-- [ ] GPU backend (CUDA via cudarc)
-- [ ] SQL-like syntax extension
-
----
-
-## 12. Building and Running
+## 11. Building and Running
 
 ```bash
 # Prerequisites
@@ -532,14 +496,14 @@ maturin build --release
 
 ---
 
-## 13. Comparison with ZLinq Philosophy
+## 12. Comparison with ZLinq Philosophy
 
 | Concept                  | ZLinq (C#)                          | ZPyFlow (Rust + Python)                    |
 |--------------------------|--------------------------------------|--------------------------------------------|
 | Allocation elimination   | Value type operator chains           | `ZStream` monomorphic chains in Rust       |
 | Iterator fusion          | Generic specialization, JIT inlining | LLVM inlining at `-O3`                     |
 | SIMD                     | Explicit via Intrinsics / Vector<T>  | `wide` crate (stable), `portable_simd` (nightly) |
-| Zero-copy                | `Span<T>`, `Memory<T>`              | `SliceStream<'a, T>`, future `PyReadonlyArray` |
+| Zero-copy                | `Span<T>`, `Memory<T>`              | `SliceStream<'a, T>`, `Arc<[f64]>` via buffer protocol (numpy) |
 | Lazy evaluation          | IEnumerable chain (deferred)         | `NumericOp` queue, fused at `.execute()`  |
 | Python/user boundary     | N/A (all C#)                         | Expr DSL collapses user intent to Rust ops |
 | Parallelism              | `AsParallel()` (PLINQ)              | `.parallel()` (Rayon)                      |

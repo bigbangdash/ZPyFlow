@@ -18,22 +18,22 @@ use crate::python::fastpath::{
 use crate::python::io_bridge::{csv_col_spec, parse_csv, parse_jsonl};
 use crate::io::ParsedOutput;
 use crate::core::{
-    count_fused_f64_bounded, count_fused_i64_bounded, count_obj_pipeline, eval_filter_f64,
-    eval_filter_i64, execute_fused_f64_bounded, execute_fused_i64_bounded, execute_obj_pipeline,
-    filter_multi_stat_f64, max_fused_f64_bounded, mean_fused_f64_bounded, min_fused_f64_bounded,
-    row_passes, stats_fused_f64_bounded, sum_field_obj_pipeline, sum_fused_f64_bounded,
-    var_fused_f64_bounded, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
+    count_fused_f64_with_skip_take, count_fused_i64_with_skip_take, count_obj_pipeline, eval_filter_f64,
+    eval_filter_i64, execute_fused_f64_with_skip_take, execute_fused_i64_with_skip_take, execute_obj_pipeline,
+    filter_multi_stat_f64, max_fused_f64_with_skip_take, mean_fused_f64_with_skip_take, min_fused_f64_with_skip_take,
+    row_passes, stats_fused_f64_with_skip_take, sum_field_obj_pipeline, sum_fused_f64_with_skip_take,
+    var_fused_f64_with_skip_take, IntOp, IntPipeline, NumericOp, NumericPipeline, ObjOp, RustRow,
     RustValue,
 };
 use super::{
     agg_build_result, agg_init_acc, agg_update, apply_py_filter, apply_py_filter_f64,
     apply_py_filter_i64, apply_py_map, apply_py_map_f64, apply_py_map_i64, apply_skip_take,
     bind_ops, branch_f64_pipeline, branch_i64_pipeline, clone_inner, collect_f64_pipeline,
-    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_bounded, execute_f64,
-    execute_i64, execute_u8, execute_u8_bounded, expr_to_int_op, group_agg_field_count,
+    collect_i64_pipeline, collect_py_lazy, count_py_lazy, count_u8_with_skip_take, execute_f64,
+    execute_i64, execute_u8, execute_u8_with_skip_take, expr_to_int_op, group_agg_field_count,
     group_by_collect as group_by_collect_fn, group_key_from_rust_value, group_key_to_py,
-    group_keys_to_py, native_slice_as_bytes, native_vec_to_numpy, parsed_to_query,
-    push_numeric_op, sum_u8_bounded, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, PyPipelineOp, PyQuery, QueryInner, take_query,
+    group_keys_to_py, native_slice_as_bytes, parsed_to_query,
+    push_numeric_op, sum_u8_with_skip_take, try_lambda_to_dsl_expr, BoundOp, collect_to_pylist, PyPipelineOp, PyQuery, QueryInner, take_query,
 };
 use ahash::AHashMap;
 use std::sync::Arc;

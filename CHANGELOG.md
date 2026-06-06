@@ -11,19 +11,70 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [0.1.1] — planned
+## [0.1.1] — 2026-06-07
+
+### Added
+
+#### Convenience methods (spec-077)
+
+| Method | Description |
+|--------|-------------|
+| `filter_map(fn)` | Apply fn; keep only non-None results — one-pass filter + map |
+| `tap(fn)` | Side-effect callback; passes elements through unchanged |
+| `compact(falsy=False)` | Drop None values (or all falsy when `falsy=True`) |
+| `min_by(key_fn)` | Element where `key_fn` is smallest; None if empty |
+| `max_by(key_fn)` | Element where `key_fn` is largest; None if empty |
+| `unzip()` | Split `(a, b)` tuples into `([a…], [b…])` |
+| `median()` | Median of a numeric pipeline; None if empty |
+| `product()` | Product of all elements (1.0 for empty) |
 
 ### Fixed
 
-- **None in mixed float lists produces consistent NaN** (spec-048).
-  `Query([1.0, None, 2.0]).filter(col > 0).to_list()` previously raised
-  `TypeError` or returned inconsistent results depending on test-suite
-  execution order. `None` is now always converted to `NaN` at the Rust
-  boundary via `PyErr_Clear`-based recovery in `pyfloat_as_f64`.
+- **None in mixed float lists** (spec-048): `Query([1.0, None, 2.0])` previously raised
+  `TypeError` or produced inconsistent results depending on test-suite execution order.
+  `None` is now always converted to `NaN` at the Rust boundary via `PyErr_Clear` in
+  `pyfloat_as_f64`.
+- **`sum_field()` on preloaded queries** (`ColumnarObj`): calling
+  `.preload().filter(field("k") > v).sum_field("k")` raised
+  `TypeError: unsupported operand type(s) for +: 'int' and 'dict'`.
+  Added a dedicated `ColumnarObj` arm that extracts the field before accumulating.
+- **`group_agg(field(...))` on preloaded queries**: `.preload().group_agg(field("k"), count=agg_count())`
+  raised `ValueError: group_agg(field(...)) requires object/dict rows`.
+  `ColumnarObj` is now included in the allowed-type check.
+- **Docker**: remove stale `cpython-*.so` before `maturin develop --release` to prevent
+  symbol conflicts on repeated builds.
+
+### Changed
+
+- **Internal architecture** (spec-050): `src/python/query.rs` (4,000-line monolith)
+  refactored into a `query/` submodule (`construct`, `filter`, `map_ops`, `terminal`,
+  `transform`). No public API changes.
+- **README**: corrected performance framing — ZPyFlow's numeric speedup comes from
+  SIMD + no PyObject construction per element, not exclusively from GIL release.
+- **`site/docs/benchmarks.md`**: added FastAPI sync-endpoint throughput section
+  (2.16× RPS over Python generator; source: per-request computation speed, not GIL release).
+
+### Build
+
+- Added `[profile.dev-release]` for faster iteration at near-release optimisation
+  with lower RAM than `--release`.
+- `[profile.bench]` now uses `lto = "thin"` to reduce peak RAM during `cargo bench`.
+
+### Tests
+
+- `tests/test_basic.py` split into purpose-specific files: `test_numeric`,
+  `test_objects`, `test_misc`, `test_io`, `test_transforms`, `test_groupby`.
+
+### Documentation
+
+- `CHANGELOG.md` added.
+- `site/docs/api.md` updated with all methods from specs 058–077.
+- `site/docs/examples/` extended with examples for new methods (specs 058–077).
+- `examples/09_sequence_tools.py` added.
 
 ---
 
-## [0.1.0] — 2026-05-xx — Initial release
+## [0.1.0] — 2026-05-31 — Initial release
 
 > **Alpha.** API may change without notice between 0.x releases.
 
@@ -134,7 +185,6 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Known limitations
 
-- `None` in mixed float lists is state-dependent (fixed in 0.1.1, see spec-048).
 - Windows wheels are not yet published to PyPI.
 - `parallel()` is experimental; GIL behaviour with nested lambdas is untested.
 

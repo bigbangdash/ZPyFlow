@@ -113,6 +113,34 @@ services:
         python sandbox/benchmark/run.py --suite $${SUITE} --compare
       "
 
+  # ── Concurrency benchmarks ─────────────────────────────────────────────────
+  bench-threading:
+    <<: *base
+    command: >
+      sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
+        maturin develop --release &&
+        python sandbox/benchmark/bench_threading.py
+      "
+
+  bench-multiprocess:
+    <<: *base
+    command: >
+      sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
+        maturin develop --release &&
+        python sandbox/benchmark/bench_multiprocess.py
+      "
+
+  bench-fastapi:
+    <<: *base
+    command: >
+      sh -c "
+        find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
+        maturin develop --release &&
+        python sandbox/benchmark/bench_fastapi.py
+      "
+
   # ── Interactive development shell ──────────────────────────────────────────
   #   docker compose run --rm shell
   shell:

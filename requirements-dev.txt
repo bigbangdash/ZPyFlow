@@ -1,0 +1,10 @@
+pytest>=7
+pytest-benchmark>=4
+numpy>=1.21
+pyarrow>=12.0
+pandas>=2.0
+polars>=0.19
+memory-profiler>=0.61
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
