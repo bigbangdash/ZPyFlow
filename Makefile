@@ -49,6 +49,11 @@ build-debug:  ## Build in debug mode (fastest compile, unoptimised)
 test: build  ## Run Python unit tests (thin-LTO build)
 	pytest tests/ -v --tb=short
 
+test-rust:  ## Run Rust unit tests (cargo test --lib; no maturin build needed)
+	cargo test --lib
+
+test-all: test-rust test  ## Run Rust unit tests then Python unit tests
+
 test-fast: build  ## Run tests without verbose output (thin-LTO build)
 	pytest tests/ -q
 
