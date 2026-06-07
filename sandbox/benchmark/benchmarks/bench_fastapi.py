@@ -168,7 +168,7 @@ if __name__ == "__main__":
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
-    def bench_endpoint(host, port, path, n_concurrent=N_CONCURRENT, n_total=N_REQUESTS):
+    def bench_endpoint(host, port, path, n_concurrent, n_total):
         url = f"http://{host}:{port}{path}"
         def one():
             t0 = time.perf_counter()
