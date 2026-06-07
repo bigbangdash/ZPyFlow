@@ -1,8 +1,12 @@
 # bench_fastapi.py — ZPyFlow in a FastAPI sync endpoint under concurrent load
 #
-# FastAPI runs `def` (sync) endpoints in a thread pool.
-# ZPyFlow numeric DSL releases the GIL → threads don't serialize → higher RPS.
-# Object pipelines using Python lambdas hold the GIL (shown for comparison).
+# Two server configurations compared side-by-side:
+#   - 1 worker  (uvicorn, single process) — isolates GIL-release effect
+#   - N workers (uvicorn --workers N)     — production-like multi-process setup
+#
+# FastAPI sync endpoints run in a thread pool per worker process.
+# ZPyFlow numeric DSL releases the GIL → threads don't serialize.
+# Object pipelines using Python lambdas hold the GIL (shown for contrast).
 #
 # Setup:
 #   pip install fastapi uvicorn httpx
@@ -11,27 +15,16 @@
 #   python sandbox/benchmark/benchmarks/bench_fastapi.py
 #   python sandbox/benchmark/run.py --suite fastapi
 
-import time
-import threading
-import concurrent.futures
+# ---------------------------------------------------------------------------
+# App definition (module-level — imported by uvicorn worker processes)
+# ---------------------------------------------------------------------------
+
+import fastapi
 
 try:
-    import fastapi
-    import uvicorn
-    import httpx
+    from zpyflow import Query, col
 except ImportError:
-    print("Missing dependencies: pip install fastapi uvicorn httpx")
-    raise SystemExit(1)
-
-try:
-    from zpyflow import Query, col, agg_count, agg_sum
-except ImportError:
-    print("zpyflow not built — run: maturin develop --profile dev-release")
-    raise SystemExit(1)
-
-# ---------------------------------------------------------------------------
-# Shared data (loaded once; endpoints read-only)
-# ---------------------------------------------------------------------------
+    raise RuntimeError("zpyflow not built — run: maturin develop --profile dev-release")
 
 N_FLOATS = 200_000
 N_DICTS  = 100_000
@@ -42,14 +35,9 @@ dicts  = [{"status": "active" if i % 3 != 0 else "inactive",
            "cat":    str(i % 10)}
           for i in range(N_DICTS)]
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
 app = fastapi.FastAPI()
 
 
-# 1. filter + count (numeric)
 @app.get("/python/filter_count")
 def ep_py_filter_count():
     return {"result": sum(1 for x in floats if x > 500)}
@@ -59,7 +47,6 @@ def ep_zp_filter_count():
     return {"result": Query(floats).filter(col > 500).count()}
 
 
-# 2. filter + sum (numeric)
 @app.get("/python/filter_sum")
 def ep_py_filter_sum():
     return {"result": sum(x for x in floats if x > 500)}
@@ -69,7 +56,6 @@ def ep_zp_filter_sum():
     return {"result": Query(floats).filter(col > 500).sum()}
 
 
-# 3. stats() — 7-stat aggregation in one pass
 @app.get("/python/stats")
 def ep_py_stats():
     xs   = [x for x in floats if x > 0]
@@ -84,7 +70,6 @@ def ep_zp_stats():
     return Query(floats).filter(col > 0).stats()
 
 
-# 4. object filter (dict, lambda — GIL held)
 @app.get("/python/object_filter")
 def ep_py_object_filter():
     result = [r for r in dicts if r["status"] == "active" and r["value"] > 300]
@@ -96,7 +81,6 @@ def ep_zp_object_filter():
     return {"count": len(result)}
 
 
-# 5. chained: filter → map → sum (numeric)
 @app.get("/python/chained")
 def ep_py_chained():
     return {"result": sum(x * 2 for x in floats if x > 500)}
@@ -107,76 +91,102 @@ def ep_zp_chained():
 
 
 # ---------------------------------------------------------------------------
-# Server
+# Benchmark runner
 # ---------------------------------------------------------------------------
 
-HOST = "127.0.0.1"
-PORT = 18765
+if __name__ == "__main__":
+    import sys
+    import time
+    import subprocess
+    import concurrent.futures
+    import httpx
+    from pathlib import Path
 
+    HOST       = "127.0.0.1"
+    PORT_1W    = 18765   # 1-worker server
+    PORT_NW    = 18766   # N-worker server
+    N_WORKERS  = 4
+    N_CONCURRENT = 8
+    N_REQUESTS   = 48
 
-def _start_server():
-    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="error")
-    uvicorn.Server(config).run()
+    BENCH_ROOT = Path(__file__).parent.parent  # sandbox/benchmark/
 
+    ENDPOINT_PAIRS = [
+        ("filter+count (numeric)", "/python/filter_count",  "/zpyflow/filter_count"),
+        ("filter+sum   (numeric)", "/python/filter_sum",    "/zpyflow/filter_sum"),
+        ("stats()      (numeric)", "/python/stats",         "/zpyflow/stats"),
+        ("object filter  (dict) ", "/python/object_filter", "/zpyflow/object_filter"),
+        ("chained f→map→sum     ", "/python/chained",       "/zpyflow/chained"),
+    ]
 
-server_thread = threading.Thread(target=_start_server, daemon=True)
-server_thread.start()
-time.sleep(1.2)  # wait for uvicorn to bind
+    def start_uvicorn(port, workers=1):
+        cmd = [
+            sys.executable, "-m", "uvicorn",
+            "benchmarks.bench_fastapi:app",
+            "--host", HOST,
+            "--port", str(port),
+            "--log-level", "error",
+        ]
+        if workers > 1:
+            cmd += ["--workers", str(workers)]
+        return subprocess.Popen(cmd, cwd=str(BENCH_ROOT),
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
 
-# ---------------------------------------------------------------------------
-# Benchmark helper
-# ---------------------------------------------------------------------------
+    def bench_endpoint(host, port, path, n_concurrent=N_CONCURRENT, n_total=N_REQUESTS):
+        url = f"http://{host}:{port}{path}"
+        def one():
+            t0 = time.perf_counter()
+            httpx.get(url, timeout=10)
+            return time.perf_counter() - t0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_concurrent) as ex:
+            t0 = time.perf_counter()
+            latencies = list(ex.map(lambda _: one(), range(n_total)))
+            wall = time.perf_counter() - t0
+        return n_total / wall, sum(latencies) / len(latencies) * 1000
 
-N_CONCURRENT = 8
-N_REQUESTS   = 48  # multiple of N_CONCURRENT
+    # ── Start both servers ─────────────────────────────────────────────────
+    print(f"Starting 1-worker  uvicorn on :{PORT_1W} ...")
+    p1w = start_uvicorn(PORT_1W, workers=1)
+    print(f"Starting {N_WORKERS}-worker uvicorn on :{PORT_NW} ...")
+    pnw = start_uvicorn(PORT_NW, workers=N_WORKERS)
+    time.sleep(2.5)  # wait for both to bind
 
+    try:
+        # ── Warmup ────────────────────────────────────────────────────────
+        for _, py_path, zp_path in ENDPOINT_PAIRS:
+            for port in (PORT_1W, PORT_NW):
+                bench_endpoint(HOST, port, py_path, n_concurrent=1, n_total=2)
+                bench_endpoint(HOST, port, zp_path, n_concurrent=1, n_total=2)
 
-def bench_endpoint(path, n_concurrent=N_CONCURRENT, n_total=N_REQUESTS):
-    url = f"http://{HOST}:{PORT}{path}"
+        # ── Run ───────────────────────────────────────────────────────────
+        print(f"\nN_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}  "
+              f"concurrent={N_CONCURRENT}  total={N_REQUESTS} req/scenario\n")
 
-    def one():
-        t0 = time.perf_counter()
-        httpx.get(url, timeout=10)
-        return time.perf_counter() - t0
+        hdr = (f"{'scenario':<28s}  "
+               f"{'1w Py':>8s}  {'1w ZPy':>8s}  {'1w ×':>6s}  "
+               f"{'Nw Py':>8s}  {'Nw ZPy':>8s}  {'Nw ×':>6s}  "
+               f"{'scale(Py)':>9s}  {'scale(ZPy)':>10s}")
+        print(hdr)
+        print("─" * len(hdr))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_concurrent) as ex:
-        t0 = time.perf_counter()
-        latencies = list(ex.map(lambda _: one(), range(n_total)))
-        wall = time.perf_counter() - t0
+        for label, py_path, zp_path in ENDPOINT_PAIRS:
+            r1_py, _ = bench_endpoint(HOST, PORT_1W, py_path)
+            r1_zp, _ = bench_endpoint(HOST, PORT_1W, zp_path)
+            rn_py, _ = bench_endpoint(HOST, PORT_NW, py_path)
+            rn_zp, _ = bench_endpoint(HOST, PORT_NW, zp_path)
+            print(f"  {label:<26s}  "
+                  f"{r1_py:>8.0f}  {r1_zp:>8.0f}  {r1_zp/r1_py:>5.2f}x  "
+                  f"{rn_py:>8.0f}  {rn_zp:>8.0f}  {rn_zp/rn_py:>5.2f}x  "
+                  f"{rn_py/r1_py:>8.2f}x  {rn_zp/r1_zp:>9.2f}x")
 
-    return n_total / wall, sum(latencies) / len(latencies) * 1000  # rps, avg_ms
+        print(f"\nColumns: 1w = 1 worker, Nw = {N_WORKERS} workers")
+        print("  × = ZPyFlow RPS / Python RPS (GIL-release speedup per worker)")
+        print("  scale = N-worker RPS / 1-worker RPS (linear = ideal multiprocess scaling)")
+        print("\nNote: object filter uses Python lambda → GIL held → × ≈ 1.0.")
 
-
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
-
-ENDPOINT_PAIRS = [
-    ("filter+count (numeric)", "/python/filter_count", "/zpyflow/filter_count"),
-    ("filter+sum   (numeric)", "/python/filter_sum",   "/zpyflow/filter_sum"),
-    ("stats()      (numeric)", "/python/stats",        "/zpyflow/stats"),
-    ("object filter  (dict) ", "/python/object_filter","/zpyflow/object_filter"),
-    ("chained f→map→sum     ", "/python/chained",      "/zpyflow/chained"),
-]
-
-print(f"N_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}  "
-      f"concurrent={N_CONCURRENT}  total={N_REQUESTS} req/scenario\n")
-
-# warmup
-for _, py_path, zp_path in ENDPOINT_PAIRS:
-    bench_endpoint(py_path, n_concurrent=1, n_total=2)
-    bench_endpoint(zp_path, n_concurrent=1, n_total=2)
-
-print(f"{'scenario':<28s}  {'Python RPS':>10s}  {'ZPyFlow RPS':>11s}  {'speedup':>8s}  {'py lat':>8s}  {'zp lat':>8s}")
-print("─" * 90)
-
-for label, py_path, zp_path in ENDPOINT_PAIRS:
-    rps_py, lat_py = bench_endpoint(py_path)
-    rps_zp, lat_zp = bench_endpoint(zp_path)
-    speedup = rps_zp / rps_py
-    print(f"  {label:<26s}  {rps_py:>10.1f}  {rps_zp:>11.1f}  {speedup:>7.2f}x  "
-          f"{lat_py:>6.1f}ms  {lat_zp:>6.1f}ms")
-
-print()
-print("Note: numeric DSL endpoints release the GIL → ZPyFlow RPS > Python RPS.")
-print("      object filter uses Python lambda → GIL held → speedup ≈ 1.0.")
+    finally:
+        p1w.terminate()
+        pnw.terminate()
+        p1w.wait()
+        pnw.wait()
