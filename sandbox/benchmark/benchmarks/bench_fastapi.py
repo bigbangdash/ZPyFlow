@@ -8,6 +8,37 @@
 # ZPyFlow numeric DSL releases the GIL → threads don't serialize.
 # Object pipelines using Python lambdas hold the GIL (shown for contrast).
 #
+# ── AWS ECS deployment notes ────────────────────────────────────────────────
+#
+# Typical ECS task definition (Fargate):
+#
+#   Container command:
+#     uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 4
+#
+#   Worker count rule of thumb:
+#     CPU-bound sync endpoints → workers = vCPU count (e.g. 4 for 4 vCPU task)
+#     Mix of async + sync      → workers = 2–4, rely on async concurrency
+#
+#   ECS scaling layers:
+#     1. Thread pool (per worker, intra-process)  ← this benchmark's "1w" column
+#     2. Workers     (per task, multi-process)    ← this benchmark's "Nw" column
+#     3. ECS tasks   (horizontal, ALB-distributed) ← linear with task count
+#
+#   ZPyFlow benefit per layer:
+#     Layer 1: GIL release → threads don't serialize → measured as "×" column
+#     Layer 2: faster per-process → measured as "scale" column staying near Nx
+#     Layer 3: same as Python (stateless request handling)
+#
+#   Dockerfile snippet:
+#     CMD ["uvicorn", "app.main:app",
+#          "--host", "0.0.0.0", "--port", "8080",
+#          "--workers", "4", "--log-level", "info"]
+#
+#   For task sizing: a 2 vCPU / 4 GB task with --workers 2 is a common starting
+#   point; scale out ECS tasks rather than up (keeps memory footprint predictable).
+#
+# ────────────────────────────────────────────────────────────────────────────
+#
 # Setup:
 #   pip install fastapi uvicorn httpx
 #
