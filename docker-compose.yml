@@ -120,7 +120,7 @@ services:
       sh -c "
         find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
-        python sandbox/benchmark/bench_threading.py
+        python sandbox/benchmark/benchmarks/bench_threading.py
       "
 
   bench-multiprocess:
@@ -129,7 +129,7 @@ services:
       sh -c "
         find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
-        python sandbox/benchmark/bench_multiprocess.py
+        python sandbox/benchmark/benchmarks/bench_multiprocess.py
       "
 
   bench-fastapi:
@@ -138,7 +138,7 @@ services:
       sh -c "
         find /app/zpyflow -name '_zpyflow.cpython-*.so' -delete ;
         maturin develop --release &&
-        python sandbox/benchmark/bench_fastapi.py
+        python sandbox/benchmark/benchmarks/bench_fastapi.py
       "
 
   # ── Interactive development shell ──────────────────────────────────────────

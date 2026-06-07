@@ -82,13 +82,13 @@ bench-rust-simd:  ## Run SIMD selectivity benchmarks
 	cargo bench --bench simd_filter
 
 bench-threading:  ## GIL release effect: Python vs ZPyFlow under N concurrent threads
-	$(PYTHON) sandbox/benchmark/bench_threading.py
+	$(PYTHON) sandbox/benchmark/benchmarks/bench_threading.py
 
 bench-multiprocess:  ## Process-level scaling: Python vs ZPyFlow with ProcessPoolExecutor
-	$(PYTHON) sandbox/benchmark/bench_multiprocess.py
+	$(PYTHON) sandbox/benchmark/benchmarks/bench_multiprocess.py
 
 bench-fastapi:  ## FastAPI sync endpoint RPS: Python vs ZPyFlow (requires fastapi uvicorn httpx)
-	$(PYTHON) sandbox/benchmark/bench_fastapi.py
+	$(PYTHON) sandbox/benchmark/benchmarks/bench_fastapi.py
 
 bench-save: build-full  ## Save current results as baseline
 	SUITE=$${SUITE:-filter} $(PYTHON) sandbox/benchmark/run.py --suite $${SUITE} --save
