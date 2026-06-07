@@ -195,19 +195,8 @@ if __name__ == "__main__":
             bench_endpoint(HOST, PORT_NW, py_path, n_concurrent=2, n_total=4)
             bench_endpoint(HOST, PORT_NW, zp_path, n_concurrent=2, n_total=4)
 
-        # ── Run ───────────────────────────────────────────────────────────
-        print(f"\nN_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}")
-        print(f"1-worker  client: concurrent={N_CONCURRENT_1W}  total={N_REQUESTS_1W} req/scenario")
-        print(f"{N_WORKERS}-workers client: concurrent={N_CONCURRENT_NW}  total={N_REQUESTS_NW} req/scenario")
-        print(f"(client load scaled ×{N_WORKERS} so each worker sees equal pressure)\n")
-
-        hdr = (f"{'scenario':<28s}  "
-               f"{'1w Py':>8s}  {'1w ZPy':>8s}  {'1w ×':>6s}  "
-               f"{'Nw Py':>8s}  {'Nw ZPy':>8s}  {'Nw ×':>6s}  "
-               f"{'scale(Py)':>9s}  {'scale(ZPy)':>10s}")
-        print(hdr)
-        print("─" * len(hdr))
-
+        # ── Collect all results first ──────────────────────────────────────
+        results = []
         for label, py_path, zp_path in ENDPOINT_PAIRS:
             r1_py, _ = bench_endpoint(HOST, PORT_1W, py_path,
                                       n_concurrent=N_CONCURRENT_1W, n_total=N_REQUESTS_1W)
@@ -217,15 +206,41 @@ if __name__ == "__main__":
                                       n_concurrent=N_CONCURRENT_NW, n_total=N_REQUESTS_NW)
             rn_zp, _ = bench_endpoint(HOST, PORT_NW, zp_path,
                                       n_concurrent=N_CONCURRENT_NW, n_total=N_REQUESTS_NW)
-            print(f"  {label:<26s}  "
-                  f"{r1_py:>8.0f}  {r1_zp:>8.0f}  {r1_zp/r1_py:>5.2f}x  "
-                  f"{rn_py:>8.0f}  {rn_zp:>8.0f}  {rn_zp/rn_py:>5.2f}x  "
-                  f"{rn_py/r1_py:>8.2f}x  {rn_zp/r1_zp:>9.2f}x")
+            results.append((label, r1_py, r1_zp, rn_py, rn_zp))
 
-        print(f"\nColumns: 1w = 1 worker, Nw = {N_WORKERS} workers")
-        print("  × = ZPyFlow RPS / Python RPS (GIL-release speedup per worker)")
-        print(f"  scale = N-worker RPS / 1-worker RPS (ideal = {N_WORKERS}.0x)")
-        print("\nNote: object filter uses Python lambda → GIL held → × ≈ 1.0.")
+        # ── Print ─────────────────────────────────────────────────────────
+        W = 64
+
+        print(f"\nN_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}  "
+              f"1w: concurrent={N_CONCURRENT_1W}  "
+              f"{N_WORKERS}w: concurrent={N_CONCURRENT_NW}\n")
+
+        # Table 1: per-worker GIL speedup (1 worker)
+        print(f"── Q1: Is ZPyFlow faster per worker? (1 worker, concurrent={N_CONCURRENT_1W}) {'─'*12}")
+        print(f"  {'scenario':<28s}  {'Python':>7s}  {'ZPyFlow':>8s}  {'speedup':>8s}")
+        print(f"  {'─'*28}  {'─'*7}  {'─'*8}  {'─'*8}")
+        for label, r1_py, r1_zp, rn_py, rn_zp in results:
+            note = "  ← lambda, GIL held" if "object" in label else ""
+            print(f"  {label:<28s}  {r1_py:>6.0f}/s  {r1_zp:>7.0f}/s  {r1_zp/r1_py:>7.2f}x{note}")
+
+        # Table 2: multi-worker scaling
+        print(f"\n── Q2: Does it scale with workers? (1w → {N_WORKERS}w, concurrent ×{N_WORKERS}) {'─'*8}")
+        print(f"  {'scenario':<28s}  {'Py 1w→Nw':>14s}  {'ZPy 1w→Nw':>15s}  {'Py scale':>9s}  {'ZPy scale':>9s}")
+        print(f"  {'─'*28}  {'─'*14}  {'─'*15}  {'─'*9}  {'─'*9}")
+        for label, r1_py, r1_zp, rn_py, rn_zp in results:
+            sc_py = rn_py / r1_py
+            sc_zp = rn_zp / r1_zp
+            warn_py = " ⚠" if sc_py < 2.0 else ""
+            warn_zp = " ⚠" if sc_zp < 2.0 else ""
+            print(f"  {label:<28s}  "
+                  f"{r1_py:>5.0f}→{rn_py:<6.0f}/s  "
+                  f"{r1_zp:>6.0f}→{rn_zp:<6.0f}/s  "
+                  f"{sc_py:>8.2f}x{warn_py:<2s}  "
+                  f"{sc_zp:>8.2f}x{warn_zp}")
+
+        print(f"\n  ⚠ = scales less than 2x (ideal = {N_WORKERS}.0x)")
+        print("  ZPyFlow SIMD ops saturate CPU per worker → adding workers")
+        print("  has diminishing returns; scale out ECS tasks instead.")
 
     finally:
         p1w.terminate()
