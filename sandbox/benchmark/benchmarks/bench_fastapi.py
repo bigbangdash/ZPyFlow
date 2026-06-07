@@ -137,8 +137,12 @@ if __name__ == "__main__":
     PORT_1W    = 18765   # 1-worker server
     PORT_NW    = 18766   # N-worker server
     N_WORKERS  = 4
-    N_CONCURRENT = 8
-    N_REQUESTS   = 48
+    # Client load is scaled with worker count so each worker sees the same
+    # concurrent pressure. 1-worker baseline: 8 concurrent / 48 requests.
+    N_CONCURRENT_1W = 8
+    N_REQUESTS_1W   = 48
+    N_CONCURRENT_NW = N_CONCURRENT_1W * N_WORKERS   # 32
+    N_REQUESTS_NW   = N_REQUESTS_1W   * N_WORKERS   # 192
 
     BENCH_ROOT = Path(__file__).parent.parent  # sandbox/benchmark/
 
@@ -186,13 +190,16 @@ if __name__ == "__main__":
     try:
         # ── Warmup ────────────────────────────────────────────────────────
         for _, py_path, zp_path in ENDPOINT_PAIRS:
-            for port in (PORT_1W, PORT_NW):
-                bench_endpoint(HOST, port, py_path, n_concurrent=1, n_total=2)
-                bench_endpoint(HOST, port, zp_path, n_concurrent=1, n_total=2)
+            bench_endpoint(HOST, PORT_1W, py_path, n_concurrent=1, n_total=2)
+            bench_endpoint(HOST, PORT_1W, zp_path, n_concurrent=1, n_total=2)
+            bench_endpoint(HOST, PORT_NW, py_path, n_concurrent=2, n_total=4)
+            bench_endpoint(HOST, PORT_NW, zp_path, n_concurrent=2, n_total=4)
 
         # ── Run ───────────────────────────────────────────────────────────
-        print(f"\nN_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}  "
-              f"concurrent={N_CONCURRENT}  total={N_REQUESTS} req/scenario\n")
+        print(f"\nN_floats={N_FLOATS:,}  N_dicts={N_DICTS:,}")
+        print(f"1-worker  client: concurrent={N_CONCURRENT_1W}  total={N_REQUESTS_1W} req/scenario")
+        print(f"{N_WORKERS}-workers client: concurrent={N_CONCURRENT_NW}  total={N_REQUESTS_NW} req/scenario")
+        print(f"(client load scaled ×{N_WORKERS} so each worker sees equal pressure)\n")
 
         hdr = (f"{'scenario':<28s}  "
                f"{'1w Py':>8s}  {'1w ZPy':>8s}  {'1w ×':>6s}  "
@@ -202,10 +209,14 @@ if __name__ == "__main__":
         print("─" * len(hdr))
 
         for label, py_path, zp_path in ENDPOINT_PAIRS:
-            r1_py, _ = bench_endpoint(HOST, PORT_1W, py_path)
-            r1_zp, _ = bench_endpoint(HOST, PORT_1W, zp_path)
-            rn_py, _ = bench_endpoint(HOST, PORT_NW, py_path)
-            rn_zp, _ = bench_endpoint(HOST, PORT_NW, zp_path)
+            r1_py, _ = bench_endpoint(HOST, PORT_1W, py_path,
+                                      n_concurrent=N_CONCURRENT_1W, n_total=N_REQUESTS_1W)
+            r1_zp, _ = bench_endpoint(HOST, PORT_1W, zp_path,
+                                      n_concurrent=N_CONCURRENT_1W, n_total=N_REQUESTS_1W)
+            rn_py, _ = bench_endpoint(HOST, PORT_NW, py_path,
+                                      n_concurrent=N_CONCURRENT_NW, n_total=N_REQUESTS_NW)
+            rn_zp, _ = bench_endpoint(HOST, PORT_NW, zp_path,
+                                      n_concurrent=N_CONCURRENT_NW, n_total=N_REQUESTS_NW)
             print(f"  {label:<26s}  "
                   f"{r1_py:>8.0f}  {r1_zp:>8.0f}  {r1_zp/r1_py:>5.2f}x  "
                   f"{rn_py:>8.0f}  {rn_zp:>8.0f}  {rn_zp/rn_py:>5.2f}x  "
@@ -213,7 +224,7 @@ if __name__ == "__main__":
 
         print(f"\nColumns: 1w = 1 worker, Nw = {N_WORKERS} workers")
         print("  × = ZPyFlow RPS / Python RPS (GIL-release speedup per worker)")
-        print("  scale = N-worker RPS / 1-worker RPS (linear = ideal multiprocess scaling)")
+        print(f"  scale = N-worker RPS / 1-worker RPS (ideal = {N_WORKERS}.0x)")
         print("\nNote: object filter uses Python lambda → GIL held → × ≈ 1.0.")
 
     finally:
