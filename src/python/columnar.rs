@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use std::collections::HashMap;
 
@@ -15,7 +16,7 @@ pub enum ColumnVec {
     F64(Vec<f64>),
     I64(Vec<i64>),
     Str(Vec<String>),
-    PyObj(Vec<PyObject>),
+    PyObj(Vec<Py<PyAny>>),
 }
 
 /// A column with an associated null bitmap.
@@ -73,7 +74,7 @@ fn extract_str(val: &Bound<'_, PyAny>) -> String {
 /// - `F64`   → `Vec<f64>`;  None/missing fills `f64::NAN`
 /// - `I64`   → `Vec<i64>`;  None/missing fills `i64::MIN`
 /// - `Str`   → `Vec<String>`; None/missing fills `""`
-/// - `Mixed` → `Vec<PyObject>`; stores original Python objects (None included)
+/// - `Mixed` → `Vec<Py<PyAny>>`; stores original Python objects (None included)
 ///
 /// A parallel `Vec<bool>` tracks which rows are null (true = null).
 pub fn convert_to_columnar(
@@ -101,7 +102,7 @@ pub fn convert_to_columnar(
 
     for i in 0..n {
         let item = data.get_item(i)?;
-        let dict = item.downcast::<PyDict>().map_err(|_| {
+        let dict = item.cast::<PyDict>().map_err(|_| {
             PyValueError::new_err(format!("row {} is not a dict", i))
         })?;
 
@@ -251,24 +252,24 @@ pub fn columnar_indices_to_py_list(
     py: Python<'_>,
     data: &ColumnarData,
     indices: &[usize],
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     let mut result = Vec::with_capacity(indices.len());
     for &i in indices {
-        let row = PyDict::new_bound(py);
+        let row = PyDict::new(py);
         for (name, col) in &data.columns {
-            let val: PyObject = if col.nulls[i] {
+            let val: Py<PyAny> = if col.nulls[i] {
                 py.None()
             } else {
                 match &col.data {
-                    ColumnVec::F64(v) => v[i].into_py(py),
-                    ColumnVec::I64(v) => v[i].into_py(py),
-                    ColumnVec::Str(v) => v[i].as_str().into_py(py),
+                    ColumnVec::F64(v) => v[i].into_py_any(py)?,
+                    ColumnVec::I64(v) => v[i].into_py_any(py)?,
+                    ColumnVec::Str(v) => v[i].as_str().into_py_any(py)?,
                     ColumnVec::PyObj(v) => v[i].clone_ref(py),
                 }
             };
             row.set_item(name, val)?;
         }
-        result.push(row.into_py(py));
+        result.push(row.into_py_any(py)?);
     }
     Ok(result)
 }
@@ -291,13 +292,13 @@ pub fn _convert_to_columnar(
     py: Python<'_>,
     data: &Bound<'_, PyList>,
     sample_size: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let schema = infer_schema_inner(data, sample_size)?;
     let columnar = convert_to_columnar(py, data, &schema)?;
 
-    let result = PyDict::new_bound(py);
+    let result = PyDict::new(py);
     for (name, col) in &columnar.columns {
-        let entry = PyDict::new_bound(py);
+        let entry = PyDict::new(py);
         let dtype_str = match &col.data {
             ColumnVec::F64(_) => "f64",
             ColumnVec::I64(_) => "i64",
@@ -306,7 +307,7 @@ pub fn _convert_to_columnar(
         };
         entry.set_item("dtype", dtype_str)?;
 
-        let data_list = PyList::empty_bound(py);
+        let data_list = PyList::empty(py);
         match &col.data {
             ColumnVec::F64(v) => {
                 for &x in v {
@@ -331,7 +332,7 @@ pub fn _convert_to_columnar(
         }
         entry.set_item("data", data_list)?;
 
-        let nulls_list = PyList::empty_bound(py);
+        let nulls_list = PyList::empty(py);
         for &is_null in &col.nulls {
             nulls_list.append(is_null)?;
         }

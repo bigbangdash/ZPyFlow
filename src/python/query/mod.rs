@@ -6,7 +6,7 @@
 //!
 //!   1. numpy f64 array (or list[float])  → `QueryInner::F64(NumericPipeline)`
 //!   2. numpy i64 array (or list[int])    → `QueryInner::I64(IntPipeline)`
-//!   3. Anything else                     → `QueryInner::Py(Vec<PyObject>)`
+//!   3. Anything else                     → `QueryInner::Py(Vec<Py<PyAny>>)`
 //!
 //! For fast-path (F64/I64) operations, when the user supplies an `Expr`
 //! (expression DSL) we translate it into a `NumericOp` and queue it.
@@ -18,17 +18,18 @@
 //! # GIL management
 //!
 //! Python callbacks: GIL held.  We call each Python callable per element.
-//! Pure Rust numeric: GIL released via `py.allow_threads(|| ...)`.
+//! Pure Rust numeric: GIL released via `py.detach(|| ...)`.
 //! Parallel numeric:  GIL released, rayon work-stealing, re-acquired at
 //!                    collection boundary.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyDict, PyList};
 
 use super::agg::{AggSpecKind, GroupKey};
 use super::columnar::{apply_columnar_ops, ColumnarData, columnar_indices_to_py_list};
-use super::conversion::rust_row_to_py;
+use super::conversion::{rust_row_to_py, to_py};
 use super::expr::{ExprOp, PyExpr, PyFieldExpr};
 use super::fastpath::{
     execute_lazy_float_list, execute_numpy_f32, execute_numpy_f64, filter_by_field,
@@ -54,10 +55,9 @@ fn native_slice_as_bytes<T>(values: &[T]) -> &[u8] {
 // ---------------------------------------------------------------------------
 
 /// A single deferred operation in the lazy Python-object pipeline.
-#[derive(Clone)]
 enum PyPipelineOp {
-    Filter(PyObject), // Python callable predicate
-    Map(PyObject),    // Python callable transform
+    Filter(Py<PyAny>), // Python callable predicate
+    Map(Py<PyAny>),    // Python callable transform
 }
 
 impl PyPipelineOp {
@@ -77,18 +77,18 @@ enum QueryInner {
     /// Compact bool/uint8 pipeline — values are numeric 0..255 and promote to i64 for maps.
     U8 { data: Arc<Vec<u8>>, ops: Vec<IntOp> },
     /// Materialized Python objects — used for F64/I64 map fallbacks
-    Py(Vec<PyObject>),
+    Py(Vec<Py<PyAny>>),
     /// Lazy Python-object pipeline.  Nothing executes until a terminal
     /// call — filter/map just accumulate ops; take short-circuits iteration.
     Obj {
-        source: PyObject,
+        source: Py<PyAny>,
         ops: Vec<PyPipelineOp>,
     },
     /// Python list[float] stored without upfront extraction.
     /// At execution time: if take << N, iterate lazily via unsafe ob_fval reads
     /// (GIL held, early exit); otherwise materialize to Vec<f64> and use SIMD.
     LazyFloatList {
-        source: PyObject,
+        source: Py<PyAny>,
         ops: Vec<NumericOp>,
     },
     /// Numpy f64 array stored without upfront copy.
@@ -105,7 +105,7 @@ enum QueryInner {
     },
     /// Rust-native object pipeline.
     /// Python dicts are converted to Arc<RustRow> once at construction (GIL held).
-    /// All filter/count/sum ops run inside py.allow_threads() without GIL.
+    /// All filter/count/sum ops run inside py.detach() without GIL.
     /// Results are converted back to Python dicts at to_list() time (GIL held).
     RustObj {
         data: Arc<Vec<RustRow>>,
@@ -121,21 +121,21 @@ enum QueryInner {
     /// All ops must filter the SAME field_name.  When a different field or a lambda
     /// arrives, this path materializes and falls back to Obj/RustObj.
     ObjField {
-        source: PyObject,     // original Python list[dict]
+        source: Py<PyAny>,     // original Python list[dict]
         field_name: Arc<str>, // the field being filtered
         ops: Vec<NumericOp>,  // f64 comparison ops (no field name needed — field extracted once)
     },
     /// Fast path for non-numeric field comparisons (string, bool, int equality).
     ///
     /// Unlike ObjField (which extracts to f64 + SIMD), this path loops in Rust
-    /// using the C API (PyDict_GetItem + PyObject comparison) — no Python function
+    /// using the C API (PyDict_GetItem + Py<PyAny> comparison) — no Python function
     /// call frames, no Python lambda overhead.
     ///
     /// Optional `map_field`: if set, `to_list()` extracts that field from each
     /// matching dict instead of returning the whole dict.  This enables full fusion
     /// of filter+map_field+take in a single Rust loop.
     ObjFieldPy {
-        source: PyObject,
+        source: Py<PyAny>,
         ops: Vec<ObjOp>,
         map_field: Option<Arc<str>>,
     },
@@ -206,30 +206,30 @@ pub(super) fn collect_to_pylist(q: &PyQuery, py: Python<'_>) -> PyResult<Py<pyo3
     match &q.inner {
         QueryInner::F64(pipeline) => {
             let result = execute_f64(py, pipeline, q.skip, q.take, q.parallel);
-            Ok(PyList::new_bound(py, &result).into())
+            Ok(PyList::new(py, &result)?.into())
         }
         QueryInner::I64(pipeline) => {
             let result = execute_i64(py, pipeline, q.skip, q.take, q.parallel);
-            Ok(PyList::new_bound(py, &result).into())
+            Ok(PyList::new(py, &result)?.into())
         }
         QueryInner::U8 { data, ops } => {
             let result = execute_u8(py, data, ops, q.skip, q.take);
-            Ok(PyList::new_bound(py, &result).into())
+            Ok(PyList::new(py, &result)?.into())
         }
         QueryInner::Py(items) => {
             let sliced = apply_skip_take(items, q.skip, q.take);
-            Ok(PyList::new_bound(py, sliced).into())
+            Ok(PyList::new(py, sliced)?.into())
         }
         QueryInner::Obj { source, ops } => {
             let items = collect_py_lazy(py, source, ops, q.skip, q.take)?;
-            Ok(PyList::new_bound(py, &items).into())
+            Ok(PyList::new(py, &items)?.into())
         }
         QueryInner::RustObj { data, ops } => {
             let data = std::sync::Arc::clone(data);
             let ops = ops.clone();
             let (skip, take) = (q.skip, q.take);
-            let rows = py.allow_threads(move || execute_obj_pipeline(&data, &ops, skip, take));
-            let list = PyList::empty_bound(py);
+            let rows = py.detach(move || execute_obj_pipeline(&data, &ops, skip, take));
+            let list = PyList::empty(py);
             for row in &rows {
                 list.append(rust_row_to_py(py, row))?;
             }
@@ -237,31 +237,31 @@ pub(super) fn collect_to_pylist(q: &PyQuery, py: Python<'_>) -> PyResult<Py<pyo3
         }
         QueryInner::LazyFloatList { source, ops } => {
             let result = execute_lazy_float_list(py, source.as_ptr(), ops, q.skip, q.take);
-            Ok(PyList::new_bound(py, &result).into())
+            Ok(PyList::new(py, &result)?.into())
         }
         QueryInner::NumpyF64 { source, ops } => {
             let result = execute_numpy_f64(py, source, ops, q.skip, q.take)?;
-            Ok(PyList::new_bound(py, &result).into())
+            Ok(PyList::new(py, &result)?.into())
         }
         QueryInner::NumpyF32 { source, ops } => {
             let result = execute_numpy_f32(py, source, ops, q.skip, q.take)?;
             let result_f64: Vec<f64> = result.iter().map(|&x| x as f64).collect();
-            Ok(PyList::new_bound(py, &result_f64).into())
+            Ok(PyList::new(py, &result_f64)?.into())
         }
         QueryInner::ObjField { source, field_name, ops } => {
             let items = filter_by_field(py, source, field_name, ops, q.skip, q.take)?;
-            Ok(PyList::new_bound(py, &items).into())
+            Ok(PyList::new(py, &items)?.into())
         }
         QueryInner::ObjFieldPy { source, ops, map_field } => {
             let items = filter_by_field_py(py, source, ops, q.skip, q.take, map_field.as_deref())?;
-            Ok(PyList::new_bound(py, items.iter().map(|o| o.bind(py))).into())
+            Ok(PyList::new(py, items.iter().map(|o| o.bind(py)))?.into())
         }
         QueryInner::ColumnarObj { data, ops } => {
             let indices = apply_columnar_ops(data, ops, q.skip, q.take);
             let rows = columnar_indices_to_py_list(py, data, &indices)?;
-            Ok(PyList::new_bound(py, rows.iter().map(|o| o.bind(py))).into())
+            Ok(PyList::new(py, rows.iter().map(|o| o.bind(py)))?.into())
         }
-        QueryInner::Empty => Ok(PyList::empty_bound(py).into()),
+        QueryInner::Empty => Ok(PyList::empty(py).into()),
     }
 }
 
@@ -339,28 +339,28 @@ fn agg_update(
 /// Convert accumulated state into Python `list[dict]`.
 fn agg_build_result(
     py: Python<'_>,
-    keys: Vec<PyObject>,
+    keys: Vec<Py<PyAny>>,
     accs: Vec<Vec<f64>>,
     names: &[String],
     kinds: &[AggSpecKind],
-) -> PyResult<PyObject> {
-    let result = PyList::empty_bound(py);
+) -> PyResult<Py<PyAny>> {
+    let result = PyList::empty(py);
     for (key, acc) in keys.into_iter().zip(accs.iter()) {
-        let row = PyDict::new_bound(py);
+        let row = PyDict::new(py);
         row.set_item("_key", key)?;
         for (i, (name, kind)) in names.iter().zip(kinds.iter()).enumerate() {
             let s = i * 2;
-            let val: PyObject = match kind {
-                AggSpecKind::Count => (acc[s] as u64).into_py(py),
-                AggSpecKind::Sum(_) => acc[s].into_py(py),
+            let val: Py<PyAny> = match kind {
+                AggSpecKind::Count => (acc[s] as u64).into_py_any(py)?,
+                AggSpecKind::Sum(_) => acc[s].into_py_any(py)?,
                 AggSpecKind::Mean(_) => {
                     if acc[s + 1] == 0.0 {
-                        f64::NAN.into_py(py)
+                        f64::NAN.into_py_any(py)?
                     } else {
-                        (acc[s] / acc[s + 1]).into_py(py)
+                        (acc[s] / acc[s + 1]).into_py_any(py)?
                     }
                 }
-                AggSpecKind::Max(_) | AggSpecKind::Min(_) => acc[s].into_py(py),
+                AggSpecKind::Max(_) | AggSpecKind::Min(_) => acc[s].into_py_any(py)?,
             };
             row.set_item(name, val)?;
         }
@@ -375,13 +375,13 @@ fn group_agg_field_count(
     field_name: Arc<str>,
     names: &[String],
     kinds: &[AggSpecKind],
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // ── RustObj path: GIL-free pipeline → AHashMap<GroupKey> (no Python objects in hot loop) ──
     if let QueryInner::RustObj { data, ops } = &query.inner {
         let data = Arc::clone(data);
         let ops = ops.clone();
         let (skip, take) = (query.skip, query.take);
-        let rows = py.allow_threads(move || execute_obj_pipeline(&data, &ops, skip, take));
+        let rows = py.detach(move || execute_obj_pipeline(&data, &ops, skip, take));
 
         let mut key_to_idx: AHashMap<GroupKey, usize> = AHashMap::new();
         let mut keys: Vec<GroupKey> = Vec::new();
@@ -426,12 +426,12 @@ fn group_agg_field_count(
         }
     }
 
-    let key_to_idx = PyDict::new_bound(py);
-    let mut keys: Vec<PyObject> = Vec::new();
+    let key_to_idx = PyDict::new(py);
+    let mut keys: Vec<Py<PyAny>> = Vec::new();
     let mut accs: Vec<Vec<f64>> = Vec::new();
 
     let mut accumulate = |item: Bound<'_, PyAny>| -> PyResult<()> {
-        let key: PyObject = if let Ok(dict) = item.downcast::<PyDict>() {
+        let key: Py<PyAny> = if let Ok(dict) = item.cast::<PyDict>() {
             dict.get_item(field_name.as_ref())?
                 .map_or_else(|| py.None(), |v| v.unbind())
         } else {
@@ -462,7 +462,7 @@ fn group_agg_field_count(
 
     if is_direct {
         if let QueryInner::Obj { source, .. } = &query.inner {
-            for item_res in source.bind(py).iter()? {
+            for item_res in source.bind(py).try_iter()? {
                 accumulate(item_res?)?;
             }
         }
@@ -486,17 +486,17 @@ fn group_key_from_rust_value(v: &RustValue) -> GroupKey {
     }
 }
 
-fn group_key_to_py(py: Python<'_>, key: &GroupKey) -> PyObject {
+fn group_key_to_py(py: Python<'_>, key: &GroupKey) -> Py<PyAny> {
     match key {
         GroupKey::Null => py.None(),
-        GroupKey::Bool(b) => b.into_py(py),
-        GroupKey::Int(i) => i.into_py(py),
-        GroupKey::Float(bits) => f64::from_bits(*bits).into_py(py),
-        GroupKey::Str(s) => s.as_ref().into_py(py),
+        GroupKey::Bool(b) => to_py(py, b),
+        GroupKey::Int(i) => to_py(py, i),
+        GroupKey::Float(bits) => to_py(py, f64::from_bits(*bits)),
+        GroupKey::Str(s) => to_py(py, s.as_ref()),
     }
 }
 
-fn group_keys_to_py(py: Python<'_>, keys: Vec<GroupKey>) -> Vec<PyObject> {
+fn group_keys_to_py(py: Python<'_>, keys: Vec<GroupKey>) -> Vec<Py<PyAny>> {
     keys.iter().map(|key| group_key_to_py(py, key)).collect()
 }
 
@@ -581,20 +581,20 @@ fn bind_ops<'py>(py: Python<'py>, ops: &[PyPipelineOp]) -> Vec<BoundOp<'py>> {
 
 fn collect_py_lazy(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     ops: &[PyPipelineOp],
     skip: usize,
     take: Option<usize>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     // Pre-bind callables once — avoids bind(py) refcount bump per element per op.
     let bound = bind_ops(py, ops);
 
-    let iter = source.bind(py).iter()?;
-    let mut out: Vec<PyObject> = Vec::new();
+    let iter = source.bind(py).try_iter()?;
+    let mut out: Vec<Py<PyAny>> = Vec::new();
     let mut skipped = 0usize;
 
     'outer: for item_res in iter {
-        let mut item: PyObject = item_res?.into();
+        let mut item: Py<PyAny> = item_res?.into();
 
         for op in &bound {
             match op {
@@ -624,19 +624,19 @@ fn collect_py_lazy(
 /// Count-only variant: same as collect_py_lazy but never builds the output Vec.
 fn count_py_lazy(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     ops: &[PyPipelineOp],
     skip: usize,
     take: Option<usize>,
 ) -> PyResult<usize> {
     let bound = bind_ops(py, ops);
 
-    let iter = source.bind(py).iter()?;
+    let iter = source.bind(py).try_iter()?;
     let mut count = 0usize;
     let mut skipped = 0usize;
 
     'outer: for item_res in iter {
-        let mut item: PyObject = item_res?.into();
+        let mut item: Py<PyAny> = item_res?.into();
 
         for op in &bound {
             match op {
@@ -668,21 +668,21 @@ fn count_py_lazy(
 /// to_list() followed by Python-side GroupBy construction.
 fn group_by_collect(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     ops: &[PyPipelineOp],
     key_fn: &Bound<'_, PyAny>,
     skip: usize,
     take: Option<usize>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let bound = bind_ops(py, ops);
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
 
-    let iter = source.bind(py).iter()?;
+    let iter = source.bind(py).try_iter()?;
     let mut skipped = 0usize;
     let mut collected = 0usize;
 
     'outer: for item_res in iter {
-        let mut item: PyObject = item_res?.into();
+        let mut item: Py<PyAny> = item_res?.into();
 
         for op in &bound {
             match op {
@@ -705,8 +705,8 @@ fn group_by_collect(
         // Compute the group key and append item to the group list.
         let key = key_fn.call1((item.clone_ref(py),))?;
         match dict.get_item(&key)? {
-            Some(list) => list.downcast::<PyList>()?.append(item.bind(py))?,
-            None => dict.set_item(&key, PyList::new_bound(py, [item]))?,
+            Some(list) => list.cast::<PyList>()?.append(item.bind(py))?,
+            None => dict.set_item(&key, PyList::new(py, [item])?)?,
         }
 
         collected += 1;
@@ -734,7 +734,7 @@ fn execute_f64(
     let ops = pipeline.clone_ops(); // value ops only — no Skip/Take mixed in
 
     // Release GIL — pure Rust from here
-    py.allow_threads(move || {
+    py.detach(move || {
         #[cfg(feature = "parallel")]
         if parallel {
             return NumericPipeline::from_arc(Arc::clone(&data))
@@ -758,7 +758,7 @@ fn execute_i64(
     let data = pipeline.arc();
     let ops = pipeline.clone_ops();
 
-    py.allow_threads(move || {
+    py.detach(move || {
         #[cfg(feature = "parallel")]
         if parallel {
             return IntPipeline::from_arc(Arc::clone(&data))
@@ -778,7 +778,7 @@ fn execute_u8(
 ) -> Vec<i64> {
     let data = Arc::clone(data);
     let ops = ops.to_vec();
-    py.allow_threads(move || execute_u8_with_skip_take(&data, &ops, skip, take))
+    py.detach(move || execute_u8_with_skip_take(&data, &ops, skip, take))
 }
 
 fn execute_u8_with_skip_take(
@@ -948,7 +948,7 @@ const FILTER_CHUNK_SIZE: usize = 256;
 fn py_filter_list<'py>(
     py: Python<'py>,
 ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-    let b = py.import_bound("builtins")?;
+    let b = py.import("builtins")?;
     Ok((b.getattr("filter")?, b.getattr("list")?))
 }
 
@@ -965,9 +965,9 @@ fn apply_py_filter_f64(
     let (filter_fn, list_fn) = py_filter_list(py)?;
     let mut out = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks(FILTER_CHUNK_SIZE) {
-        let py_chunk = PyList::new_bound(py, chunk.iter().map(|&v| v));
+        let py_chunk = PyList::new(py, chunk.iter().map(|&v| v))?;
         let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
-        for item in filtered.downcast::<PyList>()? {
+        for item in filtered.cast::<PyList>()? {
             out.push(item.extract::<f64>()?);
         }
     }
@@ -982,9 +982,9 @@ fn apply_py_filter_i64(
     let (filter_fn, list_fn) = py_filter_list(py)?;
     let mut out = Vec::with_capacity(data.len() / 2);
     for chunk in data.chunks(FILTER_CHUNK_SIZE) {
-        let py_chunk = PyList::new_bound(py, chunk.iter().map(|&v| v));
+        let py_chunk = PyList::new(py, chunk.iter().map(|&v| v))?;
         let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
-        for item in filtered.downcast::<PyList>()? {
+        for item in filtered.cast::<PyList>()? {
             out.push(item.extract::<i64>()?);
         }
     }
@@ -993,20 +993,20 @@ fn apply_py_filter_i64(
 
 fn apply_py_filter(
     py: Python<'_>,
-    items: &[PyObject],
+    items: &[Py<PyAny>],
     pred: &Bound<'_, PyAny>,
     skip: usize,
     take: Option<usize>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     let items = &items[skip.min(items.len())..];
     let cap = take.unwrap_or(items.len());
     let mut out = Vec::with_capacity(cap);
 
     let (filter_fn, list_fn) = py_filter_list(py)?;
     'outer: for chunk in items.chunks(FILTER_CHUNK_SIZE) {
-        let py_chunk = PyList::new_bound(py, chunk.iter().map(|o| o.clone_ref(py)));
+        let py_chunk = PyList::new(py, chunk.iter().map(|o| o.clone_ref(py)))?;
         let filtered = list_fn.call1((filter_fn.call1((pred, &py_chunk))?,))?;
-        for item in filtered.downcast::<PyList>()? {
+        for item in filtered.cast::<PyList>()? {
             out.push(item.unbind());
             if let Some(n) = take {
                 if out.len() >= n {
@@ -1020,7 +1020,7 @@ fn apply_py_filter(
 
 enum MappedResult {
     F64(Vec<f64>),
-    Py(Vec<PyObject>),
+    Py(Vec<Py<PyAny>>),
 }
 
 fn apply_py_map_f64(
@@ -1029,17 +1029,17 @@ fn apply_py_map_f64(
     f: &Bound<'_, PyAny>,
 ) -> PyResult<MappedResult> {
     let mut float_out: Vec<f64> = Vec::with_capacity(data.len());
-    let mut py_out: Option<Vec<PyObject>> = None;
+    let mut py_out: Option<Vec<Py<PyAny>>> = None;
 
     for (_i, val) in data.iter().enumerate() {
-        let result = f.call1((val.into_py(py),))?;
+        let result = f.call1((val.into_py_any(py)?,))?;
         if py_out.is_none() {
             if let Ok(fv) = result.extract::<f64>() {
                 float_out.push(fv);
                 continue;
             }
             // First non-float output — switch to Py mode
-            let mut pyvec: Vec<PyObject> = float_out.drain(..).map(|v| v.into_py(py)).collect();
+            let mut pyvec: Vec<Py<PyAny>> = float_out.drain(..).map(|v| to_py(py, v)).collect();
             pyvec.push(result.into());
             py_out = Some(pyvec);
         } else {
@@ -1056,7 +1056,7 @@ fn apply_py_map_f64(
 enum MappedResultI {
     I64(Vec<i64>),
     F64(Vec<f64>),
-    Py(Vec<PyObject>),
+    Py(Vec<Py<PyAny>>),
 }
 
 fn apply_py_map_i64(
@@ -1066,10 +1066,10 @@ fn apply_py_map_i64(
 ) -> PyResult<MappedResultI> {
     let mut int_out: Vec<i64> = Vec::with_capacity(data.len());
     let mut float_out: Option<Vec<f64>> = None;
-    let mut py_out: Option<Vec<PyObject>> = None;
+    let mut py_out: Option<Vec<Py<PyAny>>> = None;
 
     for val in data {
-        let result = f.call1((val.into_py(py),))?;
+        let result = f.call1((val.into_py_any(py)?,))?;
         if py_out.is_none() && float_out.is_none() {
             if let Ok(iv) = result.extract::<i64>() {
                 int_out.push(iv);
@@ -1081,14 +1081,14 @@ fn apply_py_map_i64(
                 float_out.as_mut().unwrap().push(fv);
                 continue;
             }
-            let mut pyvec: Vec<PyObject> = int_out.drain(..).map(|v| v.into_py(py)).collect();
+            let mut pyvec: Vec<Py<PyAny>> = int_out.drain(..).map(|v| to_py(py, v)).collect();
             pyvec.push(result.into());
             py_out = Some(pyvec);
         } else if let Some(ref mut fvec) = float_out {
             if let Ok(fv) = result.extract::<f64>() {
                 fvec.push(fv);
             } else {
-                let mut pyvec: Vec<PyObject> = fvec.drain(..).map(|v| v.into_py(py)).collect();
+                let mut pyvec: Vec<Py<PyAny>> = fvec.drain(..).map(|v| to_py(py, v)).collect();
                 pyvec.push(result.into());
                 py_out = Some(pyvec);
                 float_out = None;
@@ -1109,11 +1109,11 @@ fn apply_py_map_i64(
 
 fn apply_py_map(
     py: Python<'_>,
-    items: &[PyObject],
+    items: &[Py<PyAny>],
     f: &Bound<'_, PyAny>,
     skip: usize,
     take: Option<usize>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     let mut out = Vec::new();
     let mut skipped = 0;
     for item in items {
@@ -1140,7 +1140,7 @@ fn try_lambda_to_dsl_expr<'py>(
     pred: &Bound<'py, PyAny>,
 ) -> Option<Bound<'py, PyAny>> {
     // Only attempt for plain Python functions (not C callables, not Expr objects)
-    let builtins = py.import_bound("builtins").ok()?;
+    let builtins = py.import("builtins").ok()?;
     let callable = builtins.getattr("callable").ok()?;
     if !callable.call1((pred,)).ok()?.is_truthy().unwrap_or(false) {
         return None;
@@ -1150,7 +1150,7 @@ fn try_lambda_to_dsl_expr<'py>(
         return None;
     }
 
-    let parser = py.import_bound("zpyflow._lambda_parser").ok()?;
+    let parser = py.import("zpyflow._lambda_parser").ok()?;
     let result = parser
         .getattr("try_lambda_to_expr")
         .ok()?
@@ -1162,7 +1162,7 @@ fn try_lambda_to_dsl_expr<'py>(
     Some(result)
 }
 
-fn apply_skip_take<'a>(items: &'a [PyObject], skip: usize, take: Option<usize>) -> &'a [PyObject] {
+fn apply_skip_take<'a>(items: &'a [Py<PyAny>], skip: usize, take: Option<usize>) -> &'a [Py<PyAny>] {
     let start = skip.min(items.len());
     let sliced = &items[start..];
     match take {
@@ -1208,7 +1208,7 @@ fn parsed_to_query(py: Python<'_>, out: ParsedOutput) -> PyQuery {
             ops: Vec::new(),
         },
         ParsedOutput::Strs(v) => {
-            let objs: Vec<PyObject> = v.into_iter().map(|s| s.into_py(py)).collect();
+            let objs: Vec<Py<PyAny>> = v.into_iter().map(|s| to_py(py, s)).collect();
             QueryInner::Py(objs)
         }
     })

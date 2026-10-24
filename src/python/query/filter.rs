@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::python::agg::{AggSpecKind, GroupKey, PyAggSpec};
@@ -136,12 +137,12 @@ impl PyQuery {
                 // Python lambda fallback: run existing ObjOps GIL-free, materialize,
                 // then hand off to the Obj pipeline with the new lambda.
                 let materialized = execute_obj_pipeline(data, ops, self.skip, self.take);
-                let mat_list = PyList::empty_bound(py);
+                let mat_list = PyList::empty(py);
                 for row in &materialized {
                     mat_list.append(rust_row_to_py(py, row))?;
                 }
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat_list.unbind().into_py(py),
+                    source: mat_list.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Filter(pred.unbind())],
                 }))
             }
@@ -208,11 +209,11 @@ impl PyQuery {
                     self.take,
                     map_field.as_deref(),
                 )?;
-                let mat = PyList::new_bound(py, items.iter().map(|o| o.bind(py)));
+                let mat = PyList::new(py, items.iter().map(|o| o.bind(py)))?;
                 let mut new_ops: Vec<PyPipelineOp> = Vec::new();
                 new_ops.push(PyPipelineOp::Filter(pred.unbind()));
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: new_ops,
                 }))
             }
@@ -241,11 +242,11 @@ impl PyQuery {
                 }
                 // Different field, non-numeric, skip/take set, or lambda: materialize first
                 let items = filter_by_field(py, source, field_name, ops, self.skip, self.take)?;
-                let mat = PyList::new_bound(py, &items);
+                let mat = PyList::new(py, &items)?;
                 let mut new_ops: Vec<PyPipelineOp> = Vec::new();
                 new_ops.push(PyPipelineOp::Filter(pred.unbind()));
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: new_ops,
                 }))
             }
@@ -365,9 +366,9 @@ impl PyQuery {
                 // Lambda or skip/take pending: materialize to dicts, fall back to Obj
                 let indices = apply_columnar_ops(data, ops, self.skip, self.take);
                 let rows = columnar_indices_to_py_list(py, data, &indices)?;
-                let mat = PyList::new_bound(py, rows.iter().map(|o| o.bind(py)));
+                let mat = PyList::new(py, rows.iter().map(|o| o.bind(py)))?;
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Filter(pred.unbind())],
                 }))
             }
@@ -386,7 +387,7 @@ impl PyQuery {
                     if expr.op.is_filter() {
                         if let Some(op) = expr.op.to_f64_op() {
                             let data = execute_f64(py, pipeline, self.skip, self.take, false);
-                            let result = py.allow_threads(move || {
+                            let result = py.detach(move || {
                                 let n = data
                                     .iter()
                                     .position(|&x| !eval_filter_f64(x, &op))
@@ -403,7 +404,7 @@ impl PyQuery {
                 let data = execute_f64(py, pipeline, self.skip, self.take, false);
                 let mut out = Vec::new();
                 for val in data {
-                    if !pred.call1((val.into_py(py),))?.is_truthy()? {
+                    if !pred.call1((val.into_py_any(py)?,))?.is_truthy()? {
                         break;
                     }
                     out.push(val);
@@ -419,7 +420,7 @@ impl PyQuery {
                             let int_op = expr_to_int_op(&expr.op);
                             if let Some(iop) = int_op {
                                 let data = execute_i64(py, pipeline, self.skip, self.take, false);
-                                let result = py.allow_threads(move || {
+                                let result = py.detach(move || {
                                     let n = data
                                         .iter()
                                         .position(|&x| !eval_filter_i64(x, &iop))
@@ -436,7 +437,7 @@ impl PyQuery {
                 let data = execute_i64(py, pipeline, self.skip, self.take, false);
                 let mut out = Vec::new();
                 for val in data {
-                    if !pred.call1((val.into_py(py),))?.is_truthy()? {
+                    if !pred.call1((val.into_py_any(py)?,))?.is_truthy()? {
                         break;
                     }
                     out.push(val);
@@ -449,7 +450,7 @@ impl PyQuery {
                         let data = Arc::clone(data);
                         let ops_c = ops.clone();
                         let (skip, take) = (self.skip, self.take);
-                        let result = py.allow_threads(move || {
+                        let result = py.detach(move || {
                             let rows = execute_obj_pipeline(&data, &ops_c, skip, take);
                             let n = rows
                                 .iter()
@@ -468,8 +469,8 @@ impl PyQuery {
                 let ops_c = ops.clone();
                 let (skip, take) = (self.skip, self.take);
                 let rows =
-                    py.allow_threads(move || execute_obj_pipeline(&data, &ops_c, skip, take));
-                let mat = PyList::empty_bound(py);
+                    py.detach(move || execute_obj_pipeline(&data, &ops_c, skip, take));
+                let mat = PyList::empty(py);
                 for row in &rows {
                     let py_row = rust_row_to_py(py, row);
                     if !pred.call1((py_row.clone_ref(py),))?.is_truthy()? {
@@ -478,13 +479,13 @@ impl PyQuery {
                     mat.append(py_row)?;
                 }
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: Vec::new(),
                 }))
             }
             _ => {
                 let list = collect_to_pylist(self, py)?;
-                let mut out: Vec<PyObject> = Vec::new();
+                let mut out: Vec<Py<PyAny>> = Vec::new();
                 for item in list.bind(py).iter() {
                     if !pred.call1((item.clone(),))?.is_truthy()? {
                         break;
@@ -504,7 +505,7 @@ impl PyQuery {
                     if expr.op.is_filter() {
                         if let Some(op) = expr.op.to_f64_op() {
                             let data = execute_f64(py, pipeline, self.skip, self.take, false);
-                            let result = py.allow_threads(move || {
+                            let result = py.detach(move || {
                                 let start = data
                                     .iter()
                                     .position(|&x| !eval_filter_f64(x, &op))
@@ -521,7 +522,7 @@ impl PyQuery {
                 let mut skipping = true;
                 let mut out = Vec::new();
                 for val in data {
-                    if skipping && pred.call1((val.into_py(py),))?.is_truthy()? {
+                    if skipping && pred.call1((val.into_py_any(py)?,))?.is_truthy()? {
                         continue;
                     }
                     skipping = false;
@@ -536,7 +537,7 @@ impl PyQuery {
                     if expr.op.is_filter() {
                         if let Some(iop) = expr_to_int_op(&expr.op) {
                             let data = execute_i64(py, pipeline, self.skip, self.take, false);
-                            let result = py.allow_threads(move || {
+                            let result = py.detach(move || {
                                 let start = data
                                     .iter()
                                     .position(|&x| !eval_filter_i64(x, &iop))
@@ -553,7 +554,7 @@ impl PyQuery {
                 let mut skipping = true;
                 let mut out = Vec::new();
                 for val in data {
-                    if skipping && pred.call1((val.into_py(py),))?.is_truthy()? {
+                    if skipping && pred.call1((val.into_py_any(py)?,))?.is_truthy()? {
                         continue;
                     }
                     skipping = false;
@@ -567,7 +568,7 @@ impl PyQuery {
                         let data = Arc::clone(data);
                         let ops_c = ops.clone();
                         let (skip, take) = (self.skip, self.take);
-                        let result = py.allow_threads(move || {
+                        let result = py.detach(move || {
                             let rows = execute_obj_pipeline(&data, &ops_c, skip, take);
                             let start = rows
                                 .iter()
@@ -586,9 +587,9 @@ impl PyQuery {
                 let ops_c = ops.clone();
                 let (skip, take) = (self.skip, self.take);
                 let rows =
-                    py.allow_threads(move || execute_obj_pipeline(&data, &ops_c, skip, take));
+                    py.detach(move || execute_obj_pipeline(&data, &ops_c, skip, take));
                 let mut skipping = true;
-                let mat = PyList::empty_bound(py);
+                let mat = PyList::empty(py);
                 for row in &rows {
                     let py_row = rust_row_to_py(py, row);
                     if skipping && pred.call1((py_row.clone_ref(py),))?.is_truthy()? {
@@ -598,14 +599,14 @@ impl PyQuery {
                     mat.append(py_row)?;
                 }
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: Vec::new(),
                 }))
             }
             _ => {
                 let list = collect_to_pylist(self, py)?;
                 let mut skipping = true;
-                let mut out: Vec<PyObject> = Vec::new();
+                let mut out: Vec<Py<PyAny>> = Vec::new();
                 for item in list.bind(py).iter() {
                     if skipping && pred.call1((item.clone(),))?.is_truthy()? {
                         continue;

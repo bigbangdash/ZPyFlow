@@ -1,5 +1,7 @@
 use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
+use super::conversion::to_py;
 use pyo3::types::PyDict;
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ use crate::core::{ObjOp, RustValue};
 // ---------------------------------------------------------------------------
 
 /// `field("price") > 100` compiles to an ObjOp without any Python call.
-#[pyclass(name = "FieldExpr")]
+#[pyclass(name = "FieldExpr", from_py_object)]
 #[derive(Clone)]
 pub struct PyFieldExpr {
     pub(crate) name: Arc<str>,
@@ -106,14 +108,14 @@ impl PyFieldExpr {
     /// Evaluate this field expression against a Python dict.
     /// - bare `field("x")`: extracts and returns the value at key "x"
     /// - `field("x") > 5`: returns bool (filter predicate)
-    fn __call__(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn __call__(&self, py: Python<'_>, row: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let Some(op) = &self.op else {
             // bare field access — extract value, not a filter predicate
-            let dict = row.downcast::<PyDict>().map_err(|_| {
+            let dict = row.cast::<PyDict>().map_err(|_| {
                 PyTypeError::new_err(format!(
                     "FieldExpr('{}'): expected dict, got {}",
                     self.name,
-                    row.get_type().name().unwrap_or_default()
+                    row.get_type().name().map(|n| n.to_string()).unwrap_or_default()
                 ))
             })?;
             return dict
@@ -121,10 +123,10 @@ impl PyFieldExpr {
                 .map(|v| v.unbind())
                 .ok_or_else(|| PyKeyError::new_err(self.name.to_string()));
         };
-        if let Ok(dict) = row.downcast::<PyDict>() {
-            Ok(py_dict_satisfies_obj_predicate(dict, op)?.into_py(py))
+        if let Ok(dict) = row.cast::<PyDict>() {
+            Ok(py_dict_satisfies_obj_predicate(dict, op)?.into_py_any(py)?)
         } else {
-            Ok(false.into_py(py))
+            Ok(false.into_py_any(py)?)
         }
     }
 }
@@ -136,7 +138,7 @@ impl PyFieldExpr {
 /// Python-side predicate/transform descriptor.
 /// When the user writes `col > 5.0` they get back an `Expr` that maps to a
 /// Rust `NumericOp` — no GIL is needed to evaluate it.
-#[pyclass(name = "Expr")]
+#[pyclass(name = "Expr", from_py_object)]
 #[derive(Clone)]
 pub struct PyExpr {
     pub(crate) op: ExprOp,
@@ -236,39 +238,39 @@ impl ExprOp {
 #[pymethods]
 impl PyExpr {
     /// Make Expr callable from Python so it can be used as a map/filter function.
-    fn __call__(&self, py: Python<'_>, val: f64) -> PyObject {
+    fn __call__(&self, py: Python<'_>, val: f64) -> Py<PyAny> {
         match &self.op {
-            ExprOp::Gt(t) => (val > *t).into_py(py),
-            ExprOp::Ge(t) => (val >= *t).into_py(py),
-            ExprOp::Lt(t) => (val < *t).into_py(py),
-            ExprOp::Le(t) => (val <= *t).into_py(py),
-            ExprOp::Eq(t) => (val == *t).into_py(py),
-            ExprOp::Ne(t) => (val != *t).into_py(py),
-            ExprOp::Between(lo, hi) => (val >= *lo && val <= *hi).into_py(py),
-            ExprOp::SelfEq => (val == val).into_py(py),
-            ExprOp::IsNan => val.is_nan().into_py(py),
-            ExprOp::IsFinite => val.is_finite().into_py(py),
-            ExprOp::IsInf => val.is_infinite().into_py(py),
-            ExprOp::MulScalar(s) => (val * s).into_py(py),
-            ExprOp::AddScalar(s) => (val + s).into_py(py),
-            ExprOp::SubScalar(s) => (val - s).into_py(py),
-            ExprOp::DivScalar(s) => (val / s).into_py(py),
-            ExprOp::PowScalar(s) => val.powf(*s).into_py(py),
-            ExprOp::Abs => val.abs().into_py(py),
-            ExprOp::Neg => (-val).into_py(py),
-            ExprOp::Sqrt => val.sqrt().into_py(py),
-            ExprOp::Floor => val.floor().into_py(py),
-            ExprOp::Ceil => val.ceil().into_py(py),
-            ExprOp::Round => val.round().into_py(py),
-            ExprOp::Reciprocal => (1.0 / val).into_py(py),
-            ExprOp::Log => val.ln().into_py(py),
-            ExprOp::Log2 => val.log2().into_py(py),
-            ExprOp::Log10 => val.log10().into_py(py),
-            ExprOp::Exp => val.exp().into_py(py),
-            ExprOp::Sigmoid => (1.0 / (1.0 + (-val).exp())).into_py(py),
-            ExprOp::Clamp(lo, hi) => val.clamp(*lo, *hi).into_py(py),
-            ExprOp::Mod(s) => (val % s).into_py(py),
-            ExprOp::FloorDiv(s) => (val / s).floor().into_py(py),
+            ExprOp::Gt(t) => to_py(py, val > *t ),
+            ExprOp::Ge(t) => to_py(py, val >= *t ),
+            ExprOp::Lt(t) => to_py(py, val < *t ),
+            ExprOp::Le(t) => to_py(py, val <= *t ),
+            ExprOp::Eq(t) => to_py(py, val == *t ),
+            ExprOp::Ne(t) => to_py(py, val != *t ),
+            ExprOp::Between(lo, hi) => to_py(py, val >= *lo && val <= *hi ),
+            ExprOp::SelfEq => to_py(py, val == val ),
+            ExprOp::IsNan => to_py(py, val.is_nan()),
+            ExprOp::IsFinite => to_py(py, val.is_finite()),
+            ExprOp::IsInf => to_py(py, val.is_infinite()),
+            ExprOp::MulScalar(s) => to_py(py, val * s ),
+            ExprOp::AddScalar(s) => to_py(py, val + s ),
+            ExprOp::SubScalar(s) => to_py(py, val - s ),
+            ExprOp::DivScalar(s) => to_py(py, val / s ),
+            ExprOp::PowScalar(s) => to_py(py, val.powf(*s)),
+            ExprOp::Abs => to_py(py, val.abs()),
+            ExprOp::Neg => to_py(py, -val ),
+            ExprOp::Sqrt => to_py(py, val.sqrt()),
+            ExprOp::Floor => to_py(py, val.floor()),
+            ExprOp::Ceil => to_py(py, val.ceil()),
+            ExprOp::Round => to_py(py, val.round()),
+            ExprOp::Reciprocal => to_py(py, 1.0 / val ),
+            ExprOp::Log => to_py(py, val.ln()),
+            ExprOp::Log2 => to_py(py, val.log2()),
+            ExprOp::Log10 => to_py(py, val.log10()),
+            ExprOp::Exp => to_py(py, val.exp()),
+            ExprOp::Sigmoid => to_py(py, 1.0 / (1.0 + (-val).exp()) ),
+            ExprOp::Clamp(lo, hi) => to_py(py, val.clamp(*lo, *hi)),
+            ExprOp::Mod(s) => to_py(py, val % s ),
+            ExprOp::FloorDiv(s) => to_py(py, (val / s).floor()),
         }
     }
 }

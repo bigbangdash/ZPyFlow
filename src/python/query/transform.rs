@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::python::agg::{AggSpecKind, GroupKey, PyAggSpec};
@@ -90,7 +91,7 @@ impl PyQuery {
                 let b_ops = b.clone_ops();
                 let (a_skip, a_take) = (self.skip, self.take);
                 let (b_skip, b_take) = (other.skip, other.take);
-                let result = py.allow_threads(move || {
+                let result = py.detach(move || {
                     let mut out = execute_fused_f64_with_skip_take(&a_data, &a_ops, a_skip, a_take);
                     out.extend_from_slice(&execute_fused_f64_with_skip_take(
                         &b_data, &b_ops, b_skip, b_take,
@@ -108,7 +109,7 @@ impl PyQuery {
                 let b_ops = b.clone_ops();
                 let (a_skip, a_take) = (self.skip, self.take);
                 let (b_skip, b_take) = (other.skip, other.take);
-                let result = py.allow_threads(move || {
+                let result = py.detach(move || {
                     let mut out = execute_fused_i64_with_skip_take(&a_data, &a_ops, a_skip, a_take);
                     out.extend_from_slice(&execute_fused_i64_with_skip_take(
                         &b_data, &b_ops, b_skip, b_take,
@@ -121,7 +122,7 @@ impl PyQuery {
             }
             _ => {
                 let a_pylist = collect_to_pylist(self, py)?;
-                let mut a_list = a_pylist.bind(py).iter().map(|x| x.unbind()).collect::<Vec<PyObject>>();
+                let mut a_list = a_pylist.bind(py).iter().map(|x| x.unbind()).collect::<Vec<Py<PyAny>>>();
                 let b_list = collect_to_pylist(&other, py)?;
                 a_list.extend(b_list.bind(py).iter().map(|x| x.unbind()));
                 Ok(PyQuery::from_inner(QueryInner::Py(a_list)))
@@ -133,9 +134,9 @@ impl PyQuery {
     fn enumerate(&self, py: Python<'_>) -> PyResult<PyQuery> {
         use pyo3::types::PyTuple;
         let list = collect_to_pylist(self, py)?;
-        let mut out: Vec<PyObject> = Vec::with_capacity(list.bind(py).len());
+        let mut out: Vec<Py<PyAny>> = Vec::with_capacity(list.bind(py).len());
         for (i, item) in list.bind(py).iter().enumerate() {
-            let t = PyTuple::new_bound(py, [i.into_py(py), item.unbind()]);
+            let t = PyTuple::new(py, [i.into_py_any(py)?, item.unbind()])?;
             out.push(t.into());
         }
         Ok(PyQuery::from_inner(QueryInner::Py(out)))
@@ -147,9 +148,9 @@ impl PyQuery {
         let a = collect_to_pylist(self, py)?;
         let b = collect_to_pylist(&other, py)?;
         let n = a.bind(py).len().min(b.bind(py).len());
-        let mut out: Vec<PyObject> = Vec::with_capacity(n);
+        let mut out: Vec<Py<PyAny>> = Vec::with_capacity(n);
         for (x, y) in a.bind(py).iter().zip(b.bind(py).iter()) {
-            let t = PyTuple::new_bound(py, [x.unbind(), y.unbind()]);
+            let t = PyTuple::new(py, [x.unbind(), y.unbind()])?;
             out.push(t.into());
         }
         Ok(PyQuery::from_inner(QueryInner::Py(out)))

@@ -47,7 +47,7 @@ impl PyQuery {
     #[new]
     #[pyo3(signature = (data, /))]
     fn new(_py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(list) = data.downcast::<pyo3::types::PyList>() {
+        if let Ok(list) = data.cast::<pyo3::types::PyList>() {
             if list.is_empty() {
                 return Ok(PyQuery::from_inner(QueryInner::F64(NumericPipeline::new(
                     vec![],
@@ -127,7 +127,7 @@ impl PyQuery {
         let src = buf.buf_ptr::<i64>() as usize;
         let mut data = vec![0i64; n];
         let dst = data.as_mut_ptr() as usize;
-        py.allow_threads(move || unsafe {
+        py.detach(move || unsafe {
             std::ptr::copy_nonoverlapping(src as *const i64, dst as *mut i64, n);
         });
         Ok(PyQuery::from_inner(QueryInner::I64(IntPipeline::new(data))))
@@ -158,7 +158,7 @@ impl PyQuery {
         let src = buf.buf_ptr::<u8>() as usize;
         let mut data = vec![0u8; n];
         let dst = data.as_mut_ptr() as usize;
-        py.allow_threads(move || unsafe {
+        py.detach(move || unsafe {
             std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n);
         });
         Ok(PyQuery::from_inner(QueryInner::U8 {
@@ -184,7 +184,7 @@ impl PyQuery {
     /// ```
     #[staticmethod]
     fn f64(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Self> {
-        let list = data.iter()?;
+        let list = data.try_iter()?;
         let mut out = Vec::new();
         for item in list {
             let item = item?;
@@ -211,7 +211,7 @@ impl PyQuery {
     /// ```
     #[staticmethod]
     fn i64(py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<Self> {
-        let list = data.iter()?;
+        let list = data.try_iter()?;
         let mut out = Vec::new();
         for item in list {
             let item = item?;
@@ -253,7 +253,7 @@ impl PyQuery {
         let col = csv_col_spec(column_name, column_idx);
 
         let out = py
-            .allow_threads(move || -> Result<ParsedOutput, String> {
+            .detach(move || -> Result<ParsedOutput, String> {
                 let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                 parse_csv(bytes, col, &dtype, delim, has_header)
             })
@@ -279,7 +279,7 @@ impl PyQuery {
         let col = csv_col_spec(column_name, column_idx);
 
         let out = py
-            .allow_threads(move || -> Result<ParsedOutput, String> {
+            .detach(move || -> Result<ParsedOutput, String> {
                 parse_csv(bytes, col, &dtype, delim, has_header)
             })
             .map_err(|e| PyValueError::new_err(e))?;
@@ -298,7 +298,7 @@ impl PyQuery {
         let path = path.to_string();
         let dtype = dtype.to_string();
         let out = py
-            .allow_threads(move || -> Result<ParsedOutput, String> {
+            .detach(move || -> Result<ParsedOutput, String> {
                 let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                 parse_jsonl(bytes, field_name, &dtype)
             })
@@ -318,7 +318,7 @@ impl PyQuery {
         let bytes = data.to_vec();
         let dtype = dtype.to_string();
         let out = py
-            .allow_threads(move || -> Result<ParsedOutput, String> {
+            .detach(move || -> Result<ParsedOutput, String> {
                 parse_jsonl(bytes, field_name, &dtype)
             })
             .map_err(|e| PyValueError::new_err(e))?;

@@ -77,7 +77,7 @@ pub fn infer_schema_inner(
 
     // Seed schema from the first row.
     let first = data.get_item(0)?;
-    let first_dict = match first.downcast::<PyDict>() {
+    let first_dict = match first.cast::<PyDict>() {
         Ok(d) => d,
         Err(_) => return Ok(HashMap::new()),
     };
@@ -91,7 +91,7 @@ pub fn infer_schema_inner(
     // Merge subsequent rows.
     for i in 1..n {
         let item = data.get_item(i)?;
-        let dict = match item.downcast::<PyDict>() {
+        let dict = match item.cast::<PyDict>() {
             Ok(d) => d,
             Err(_) => {
                 // Non-dict row: mark all fields as Mixed.
@@ -136,9 +136,9 @@ pub fn _infer_schema(
     py: Python<'_>,
     data: &Bound<'_, PyList>,
     sample_size: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let schema = infer_schema_inner(data, sample_size)?;
-    let result = PyDict::new_bound(py);
+    let result = PyDict::new(py);
     for (k, v) in &schema {
         result.set_item(k, v.as_str())?;
     }

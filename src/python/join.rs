@@ -15,7 +15,7 @@ enum JoinKey {
 }
 
 fn extract_join_key(row: &Bound<'_, PyAny>, field: &str) -> PyResult<Option<JoinKey>> {
-    let Ok(d) = row.downcast::<PyDict>() else {
+    let Ok(d) = row.cast::<PyDict>() else {
         return Ok(None);
     };
     let Some(val) = d.get_item(field)? else {
@@ -38,11 +38,11 @@ fn merge_dicts<'py>(
     left: &Bound<'py, PyAny>,
     right: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let out = PyDict::new_bound(py);
-    if let Ok(ld) = left.downcast::<PyDict>() {
+    let out = PyDict::new(py);
+    if let Ok(ld) = left.cast::<PyDict>() {
         out.update(ld.as_mapping())?;
     }
-    if let Ok(rd) = right.downcast::<PyDict>() {
+    if let Ok(rd) = right.cast::<PyDict>() {
         out.update(rd.as_mapping())?;
     }
     Ok(out)
@@ -73,7 +73,7 @@ pub fn _hash_join_by_field<'py>(
     }
 
     // Probe left side
-    let result = PyList::empty_bound(py);
+    let result = PyList::empty(py);
     for left_row in left {
         let Some(key) = extract_join_key(&left_row, field)? else {
             continue;

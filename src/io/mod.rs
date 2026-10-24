@@ -1,7 +1,7 @@
 /// GIL-free CSV and JSON Lines parsers.
 ///
 /// All public functions take owned Rust data (`Vec<u8>`) and return owned results
-/// so they can run inside `py.allow_threads()` without touching any Python objects.
+/// so they can run inside `py.detach()` without touching any Python objects.
 
 pub mod csv;
 pub mod jsonl;

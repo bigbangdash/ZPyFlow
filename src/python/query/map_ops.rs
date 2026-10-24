@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::python::agg::{AggSpecKind, GroupKey, PyAggSpec};
@@ -275,13 +276,13 @@ impl PyQuery {
                 let ops_c = ops.clone();
                 let (skip, take) = (self.skip, self.take);
                 let rows =
-                    py.allow_threads(move || execute_obj_pipeline(&data, &ops_c, skip, take));
-                let mat_list = PyList::empty_bound(py);
+                    py.detach(move || execute_obj_pipeline(&data, &ops_c, skip, take));
+                let mat_list = PyList::empty(py);
                 for row in &rows {
                     mat_list.append(rust_row_to_py(py, row))?;
                 }
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat_list.unbind().into_py(py),
+                    source: mat_list.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Map(f.unbind())],
                 }))
             }
@@ -292,9 +293,9 @@ impl PyQuery {
             } => {
                 // Materialize filtered items, then apply map as Obj pipeline.
                 let items = filter_by_field(py, source, field_name, ops, self.skip, self.take)?;
-                let mat = PyList::new_bound(py, &items);
+                let mat = PyList::new(py, &items)?;
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Map(f.unbind())],
                 }))
             }
@@ -312,9 +313,9 @@ impl PyQuery {
                     self.take,
                     map_field.as_deref(),
                 )?;
-                let mat = PyList::new_bound(py, items.iter().map(|o| o.bind(py)));
+                let mat = PyList::new(py, items.iter().map(|o| o.bind(py)))?;
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Map(f.unbind())],
                 }))
             }
@@ -322,9 +323,9 @@ impl PyQuery {
                 // Materialize to dicts, then apply map as Obj pipeline
                 let indices = apply_columnar_ops(data, ops, self.skip, self.take);
                 let rows = columnar_indices_to_py_list(py, data, &indices)?;
-                let mat = PyList::new_bound(py, rows.iter().map(|o| o.bind(py)));
+                let mat = PyList::new(py, rows.iter().map(|o| o.bind(py)))?;
                 Ok(PyQuery::from_inner(QueryInner::Obj {
-                    source: mat.unbind().into_py(py),
+                    source: mat.unbind().into_py_any(py)?,
                     ops: vec![PyPipelineOp::Map(f.unbind())],
                 }))
             }
@@ -338,10 +339,10 @@ impl PyQuery {
 
     fn flat_map(&self, py: Python<'_>, f: Bound<'_, PyAny>) -> PyResult<PyQuery> {
         let list = collect_to_pylist(self, py)?;
-        let mut out: Vec<PyObject> = Vec::new();
+        let mut out: Vec<Py<PyAny>> = Vec::new();
         for item in list.bind(py).iter() {
             let sub = f.call1((item,))?;
-            for elem in sub.iter()? {
+            for elem in sub.try_iter()? {
                 out.push(elem?.unbind());
             }
         }
@@ -362,7 +363,7 @@ impl PyQuery {
     fn preload(&self, py: Python<'_>) -> PyResult<PyQuery> {
         if let QueryInner::Obj { source, ops } = &self.inner {
             if ops.is_empty() {
-                if let Ok(list) = source.bind(py).downcast::<PyList>() {
+                if let Ok(list) = source.bind(py).cast::<PyList>() {
                     // Try columnar conversion first (spec-082 T4 primary path)
                     let schema = infer_schema_inner(list, 100)?;
                     if !schema.is_empty() {
@@ -417,7 +418,7 @@ impl PyQuery {
             _ => {
                 // Generic path: use operator.itemgetter (C-level, faster than lambda)
                 let op = py
-                    .import_bound("operator")?
+                    .import("operator")?
                     .getattr("itemgetter")?
                     .call1((field_name,))?;
                 self.map(py, op)

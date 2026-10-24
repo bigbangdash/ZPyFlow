@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use super::conversion::to_py;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::core::numeric::pipeline::{apply_scalar_op, ScalarResult};
 #[repr(C)]
 struct PyBufView {
     buf: *mut std::ffi::c_void,
-    obj: *mut std::ffi::c_void, // PyObject* — we never dereference
+    obj: *mut std::ffi::c_void, // Py<PyAny>* — we never dereference
     len: isize,
     itemsize: isize,
     readonly: std::ffi::c_int,
@@ -347,7 +348,7 @@ pub(super) fn execute_lazy_float_list(
         }
 
         let chunk_slice = &chunk_buf[..chunk_size];
-        let filtered = py.allow_threads(|| execute_fused_f64_with_skip_take(chunk_slice, ops, 0, None));
+        let filtered = py.detach(|| execute_fused_f64_with_skip_take(chunk_slice, ops, 0, None));
 
         for val in filtered {
             if skipped < skip {
@@ -389,22 +390,22 @@ pub(super) fn objop_to_numeric(op: &ObjOp) -> Option<(Arc<str>, NumericOp)> {
 /// Python dict references (no dict copy).
 pub(super) fn filter_by_field(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     field_name: &str,
     ops: &[NumericOp],
     skip: usize,
     take: Option<usize>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     use pyo3::ffi;
 
     let list = source
         .bind(py)
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjField source must be a list"))?;
     let list_ptr = list.as_ptr();
     let n = list.len();
 
-    let key = pyo3::types::PyString::new_bound(py, field_name);
+    let key = pyo3::types::PyString::new(py, field_name);
     let key_ptr = key.as_ptr();
 
     let mut values: Vec<f64> = Vec::with_capacity(n);
@@ -439,7 +440,7 @@ pub(super) fn filter_by_field(
     let ptr = values.as_ptr() as usize;
     let ops_c = ops.to_vec();
     // Safety: `values` lives in the enclosing frame, valid for the whole allow_threads call.
-    let indices: Vec<usize> = py.allow_threads(move || {
+    let indices: Vec<usize> = py.detach(move || {
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
         let mut out: Vec<usize> = Vec::new();
         let mut skipped = 0usize;
@@ -461,13 +462,13 @@ pub(super) fn filter_by_field(
         out
     });
 
-    let mut result: Vec<PyObject> = Vec::with_capacity(indices.len());
+    let mut result: Vec<Py<PyAny>> = Vec::with_capacity(indices.len());
     for &i in &indices {
         let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
         unsafe {
             ffi::Py_INCREF(item_ptr);
         }
-        result.push(unsafe { PyObject::from_owned_ptr(py, item_ptr) });
+        result.push(unsafe { Bound::from_owned_ptr(py, item_ptr).unbind() });
     }
     Ok(result)
 }
@@ -478,7 +479,7 @@ pub(super) fn filter_by_field(
 /// then filters and accumulates GIL-free.  No matching Python dicts are re-visited.
 pub(super) fn sum_field_by_field(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     filter_field: &str,
     ops: &[NumericOp],
     sum_field: &str,
@@ -489,14 +490,14 @@ pub(super) fn sum_field_by_field(
 
     let list = source
         .bind(py)
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjField source must be a list"))?;
     let list_ptr = list.as_ptr();
     let n = list.len();
 
     let same_field = filter_field == sum_field;
 
-    let fkey = pyo3::types::PyString::new_bound(py, filter_field);
+    let fkey = pyo3::types::PyString::new(py, filter_field);
     let fkey_ptr = fkey.as_ptr();
 
     let mut filter_vals: Vec<f64> = Vec::with_capacity(n);
@@ -514,7 +515,7 @@ pub(super) fn sum_field_by_field(
             filter_vals.push(f);
         }
     } else {
-        let skey = pyo3::types::PyString::new_bound(py, sum_field);
+        let skey = pyo3::types::PyString::new(py, sum_field);
         let skey_ptr = skey.as_ptr();
         for i in 0..n {
             let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
@@ -534,7 +535,7 @@ pub(super) fn sum_field_by_field(
     // Safety: fptr/sptr point into filter_vals/sum_vals, which live in the
     // enclosing stack frame for the entire duration of allow_threads (which
     // blocks until the closure returns before those Vecs are dropped).
-    Ok(py.allow_threads(move || {
+    Ok(py.detach(move || {
         let fslice = unsafe { std::slice::from_raw_parts(fptr as *const f64, n) };
         let sslice = unsafe { std::slice::from_raw_parts(sptr as *const f64, n) };
         let mut acc = 0.0f64;
@@ -600,7 +601,7 @@ unsafe fn extract_f64_from_dict_item(
 /// Count variant of filter_by_field — no output Vec, GIL-free comparison.
 pub(super) fn count_by_field(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     field_name: &str,
     ops: &[NumericOp],
     skip: usize,
@@ -608,15 +609,15 @@ pub(super) fn count_by_field(
 ) -> PyResult<usize> {
     let list = source
         .bind(py)
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjField source must be a list"))?;
     let n = list.len();
 
-    let key = pyo3::types::PyString::new_bound(py, field_name);
+    let key = pyo3::types::PyString::new(py, field_name);
     let mut values: Vec<f64> = Vec::with_capacity(n);
     for i in 0..n {
         let item = list.get_item(i)?;
-        let v = if let Ok(dict) = item.downcast::<PyDict>() {
+        let v = if let Ok(dict) = item.cast::<PyDict>() {
             match dict.get_item(&key)? {
                 Some(val) => val.extract::<f64>().unwrap_or(f64::NAN),
                 None => f64::NAN,
@@ -630,7 +631,7 @@ pub(super) fn count_by_field(
     let ptr = values.as_ptr() as usize;
     let ops_c = ops.to_vec();
     // Safety: `values` lives in the enclosing frame, valid for the whole allow_threads call.
-    Ok(py.allow_threads(move || {
+    Ok(py.detach(move || {
         let slice = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
         count_fused_f64_with_skip_take(slice, &ops_c, skip, take)
     }))
@@ -645,8 +646,8 @@ pub(super) fn objop_is_field_filter(op: &ObjOp) -> bool {
 /// Prepared form of one ObjFieldPy filter op for the FFI hot loop.
 /// Pre-builds Python key and target objects once — avoids per-element allocations.
 struct PreparedFieldOp {
-    key_py: PyObject,
-    target: PyObject,
+    key_py: Py<PyAny>,
+    target: Py<PyAny>,
     is_eq: bool,
 }
 
@@ -658,16 +659,16 @@ fn precompile_obj_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<Prepa
                 ObjOp::FilterFieldNe(f, v) => (f, v, false),
                 _ => return None,
             };
-            let py_key: PyObject = pyo3::types::PyString::new_bound(py, fname.as_ref())
+            let py_key: Py<PyAny> = pyo3::types::PyString::new(py, fname.as_ref())
                 .unbind()
                 .into();
-            let py_target: PyObject = match rv {
-                RustValue::Str(s) => pyo3::types::PyString::new_bound(py, s.as_ref())
+            let py_target: Py<PyAny> = match rv {
+                RustValue::Str(s) => pyo3::types::PyString::new(py, s.as_ref())
                     .unbind()
                     .into(),
-                RustValue::Bool(b) => b.into_py(py),
-                RustValue::Int(i) => i.into_py(py),
-                RustValue::Float(f) => f.into_py(py),
+                RustValue::Bool(b) => to_py(py, b),
+                RustValue::Int(i) => to_py(py, i),
+                RustValue::Float(f) => to_py(py, f),
                 RustValue::Null => py.None(),
             };
             Some(Ok(PreparedFieldOp {
@@ -682,26 +683,26 @@ fn precompile_obj_field_ops(py: Python<'_>, ops: &[ObjOp]) -> PyResult<Vec<Prepa
 /// Fast path for non-numeric field filtering — uses raw CPython FFI per element.
 pub(super) fn filter_by_field_py(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     ops: &[ObjOp],
     skip: usize,
     take: Option<usize>,
     map_field: Option<&str>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     use pyo3::ffi;
 
     let list = source
         .bind(py)
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjFieldPy source must be a list"))?;
     let list_ptr = list.as_ptr();
     let n = list.len();
 
     let prepared = precompile_obj_field_ops(py, ops)?;
-    let map_key: Option<PyObject> =
-        map_field.map(|s| pyo3::types::PyString::new_bound(py, s).unbind().into());
+    let map_key: Option<Py<PyAny>> =
+        map_field.map(|s| pyo3::types::PyString::new(py, s).unbind().into());
 
-    let mut result: Vec<PyObject> = Vec::new();
+    let mut result: Vec<Py<PyAny>> = Vec::new();
     let mut skipped = 0usize;
 
     'outer: for i in 0..n {
@@ -737,7 +738,7 @@ pub(super) fn filter_by_field_py(
             continue;
         }
 
-        let output: PyObject = if let Some(ref mk) = map_key {
+        let output: Py<PyAny> = if let Some(ref mk) = map_key {
             let val = unsafe { ffi::PyDict_GetItemWithError(item_ptr, mk.as_ptr()) };
             if val.is_null() {
                 unsafe {
@@ -748,13 +749,13 @@ pub(super) fn filter_by_field_py(
                 unsafe {
                     ffi::Py_INCREF(val);
                 }
-                unsafe { PyObject::from_owned_ptr(py, val) }
+                unsafe { Bound::from_owned_ptr(py, val).unbind() }
             }
         } else {
             unsafe {
                 ffi::Py_INCREF(item_ptr);
             }
-            unsafe { PyObject::from_owned_ptr(py, item_ptr) }
+            unsafe { Bound::from_owned_ptr(py, item_ptr).unbind() }
         };
 
         result.push(output);
@@ -768,7 +769,7 @@ pub(super) fn filter_by_field_py(
 /// Count variant — no output Vec, just counts matching items.
 pub(super) fn count_by_field_py(
     py: Python<'_>,
-    source: &PyObject,
+    source: &Py<PyAny>,
     ops: &[ObjOp],
     skip: usize,
     take: Option<usize>,
@@ -777,7 +778,7 @@ pub(super) fn count_by_field_py(
 
     let list = source
         .bind(py)
-        .downcast::<PyList>()
+        .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjFieldPy source must be a list"))?;
     let list_ptr = list.as_ptr();
     let n = list.len();
@@ -840,7 +841,7 @@ pub(super) fn execute_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         execute_fused_f64_with_skip_take(slice, ops, skip, take)
     });
@@ -857,7 +858,7 @@ pub(super) fn count_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         count_fused_f64_with_skip_take(slice, ops, skip, take)
     });
@@ -974,7 +975,7 @@ pub(super) fn sum_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         if skip == 0 && take.is_none() {
             if let Some(s) = filter_sum_fused_f64(slice, ops) {
@@ -998,7 +999,7 @@ pub(super) fn mean_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         if skip == 0 && take.is_none() {
             if let Some(mean) = filter_mean_fused_f64(slice, ops) {
@@ -1021,7 +1022,7 @@ pub(super) fn var_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         compute_variance_f64_with_skip_take(slice, ops, skip, take)
     });
@@ -1038,7 +1039,7 @@ pub(super) fn min_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, min, _)| min)
     });
@@ -1055,7 +1056,7 @@ pub(super) fn max_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         compute_stats_f64_with_skip_take(slice, ops, skip, take).map(|(_, _, _, max)| max)
     });
@@ -1072,7 +1073,7 @@ pub(super) fn stats_numpy_f64(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f64>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
         if skip == 0 && take.is_none() {
             // Fast path for pure filter chains; falls through for maps.
@@ -1106,7 +1107,7 @@ pub(super) fn execute_numpy_f32(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f32>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
         execute_fused_f32_with_skip_take(slice, ops, skip, take)
     });
@@ -1124,7 +1125,7 @@ pub(super) fn count_numpy_f32(
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
     let n = buf.item_count();
     let ptr = buf.buf_ptr::<f32>() as usize;
-    let result = py.allow_threads(|| unsafe {
+    let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
         count_fused_f32_with_skip_take(slice, ops, skip, take)
     });
@@ -1141,9 +1142,9 @@ mod tests {
 
     #[test]
     fn test_materialize_normal() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let list = PyList::new_bound(py, [1.0f64, 2.0, 3.0]);
+        Python::initialize();
+        Python::attach(|py| {
+            let list = PyList::new(py, [1.0f64, 2.0, 3.0]).unwrap();
             let result = materialize_lazy_float_list(list.as_ptr());
             assert_eq!(result, vec![1.0, 2.0, 3.0]);
         });
@@ -1151,9 +1152,9 @@ mod tests {
 
     #[test]
     fn test_materialize_empty() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let list = PyList::empty_bound(py);
+        Python::initialize();
+        Python::attach(|py| {
+            let list = PyList::empty(py);
             let result = materialize_lazy_float_list(list.as_ptr());
             assert!(result.is_empty());
         });
@@ -1161,10 +1162,10 @@ mod tests {
 
     #[test]
     fn test_materialize_integers_coerced() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             // Python list of ints → floats via PyLong_AsDouble
-            let list = PyList::new_bound(py, [1i64, 2, 3]);
+            let list = PyList::new(py, [1i64, 2, 3]).unwrap();
             let result = materialize_lazy_float_list(list.as_ptr());
             assert_eq!(result, vec![1.0, 2.0, 3.0]);
         });
@@ -1174,10 +1175,10 @@ mod tests {
 
     #[test]
     fn test_count_matches_execute() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let data: Vec<f64> = (0..100).map(|i| i as f64).collect();
-            let list = PyList::new_bound(py, &data);
+            let list = PyList::new(py, &data).unwrap();
             let ops = vec![NumericOp::FilterGt(50.0)];
 
             let count = count_lazy_float_list(list.as_ptr(), &ops, 0, None);
@@ -1190,10 +1191,10 @@ mod tests {
 
     #[test]
     fn test_count_with_skip_take() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let data: Vec<f64> = (0..20).map(|i| i as f64).collect();
-            let list = PyList::new_bound(py, &data);
+            let list = PyList::new(py, &data).unwrap();
             let ops = vec![NumericOp::FilterGt(5.0)];
 
             // count_lazy_float_list with skip/take falls back to count_fused_f64_with_skip_take,
@@ -1207,9 +1208,9 @@ mod tests {
 
     #[test]
     fn test_count_empty_list() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let list = PyList::empty_bound(py);
+        Python::initialize();
+        Python::attach(|py| {
+            let list = PyList::empty(py);
             let count = count_lazy_float_list(list.as_ptr(), &[], 0, None);
             assert_eq!(count, 0);
         });
@@ -1219,12 +1220,12 @@ mod tests {
 
     #[test]
     fn test_extract_f64_from_float_value() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             use pyo3::types::{PyDict, PyString};
-            let dict = PyDict::new_bound(py);
+            let dict = PyDict::new(py);
             dict.set_item("score", 3.14f64).unwrap();
-            let key = PyString::new_bound(py, "score");
+            let key = PyString::new(py, "score");
             let result = unsafe {
                 extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
             };
@@ -1234,12 +1235,12 @@ mod tests {
 
     #[test]
     fn test_extract_f64_from_int_value() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             use pyo3::types::{PyDict, PyString};
-            let dict = PyDict::new_bound(py);
+            let dict = PyDict::new(py);
             dict.set_item("count", 42i64).unwrap();
-            let key = PyString::new_bound(py, "count");
+            let key = PyString::new(py, "count");
             let result = unsafe {
                 extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
             };
@@ -1249,11 +1250,11 @@ mod tests {
 
     #[test]
     fn test_extract_f64_missing_key_returns_nan() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             use pyo3::types::{PyDict, PyString};
-            let dict = PyDict::new_bound(py);
-            let key = PyString::new_bound(py, "missing");
+            let dict = PyDict::new(py);
+            let key = PyString::new(py, "missing");
             let result = unsafe {
                 extract_f64_from_dict_item(dict.as_ptr(), key.as_ptr())
             };
@@ -1263,11 +1264,11 @@ mod tests {
 
     #[test]
     fn test_extract_f64_null_ptr_returns_nan() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|_py| {
+        Python::initialize();
+        Python::attach(|_py| {
             use pyo3::types::PyString;
-            Python::with_gil(|py| {
-                let key = PyString::new_bound(py, "k");
+            Python::attach(|py| {
+                let key = PyString::new(py, "k");
                 let result = unsafe {
                     extract_f64_from_dict_item(std::ptr::null_mut(), key.as_ptr())
                 };

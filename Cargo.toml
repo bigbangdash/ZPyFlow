@@ -20,7 +20,7 @@ arrow   = []  # reserved feature flag — arrow2 removed (RUSTSEC-2025-0038, no 
 extension-module = ["pyo3/extension-module"]  # enabled by maturin via pyproject.toml; absent for cargo test
 
 [dependencies]
-pyo3        = { version = "0.21", features = ["abi3-py310", "multiple-pymethods"] }
+pyo3        = { version = "0.29", features = ["abi3-py310", "multiple-pymethods"] }
 rayon       = { version = "1.9", optional = true }
 wide        = "0.7"     # Stable portable SIMD - f64x4, f32x8, i64x4, etc.
 num-traits  = "0.2"
@@ -31,7 +31,7 @@ regex       = { version = "1", default-features = false, features = ["std", "uni
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-pyo3      = { version = "0.21", features = ["auto-initialize"] }
+pyo3      = { version = "0.29", features = ["auto-initialize"] }
 
 [[bench]]
 name    = "pipeline"
