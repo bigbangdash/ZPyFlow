@@ -11,7 +11,6 @@ use crate::core::{
 };
 use crate::core::numeric::pipeline::{apply_scalar_op, ScalarResult};
 
-
 // ---------------------------------------------------------------------------
 // abi3-compatible buffer protocol — wraps PyObject_GetBuffer / PyBuffer_Release.
 // These functions are in Py_LIMITED_API (stable ABI) since Python 3.0.
@@ -37,9 +36,37 @@ struct PyBufView {
     internal: *mut std::ffi::c_void,
 }
 
-/// `PyBUF_C_CONTIGUOUS` — request a C-contiguous view with ndim/shape/strides filled in.
-/// Computed as: `0x0020 | 0x0010 | 0x0008` (PyBUF_C_CONTIGUOUS | PyBUF_STRIDES | PyBUF_ND).
-const PY_BUF_C_CONTIGUOUS: std::ffi::c_int = 0x0038;
+/// `PyBUF_C_CONTIGUOUS | PyBUF_FORMAT` — request a C-contiguous view with
+/// ndim/shape/strides and the struct-module format string filled in.
+/// Computed as: `0x0020 | 0x0010 | 0x0008 | 0x0004`
+/// (PyBUF_C_CONTIGUOUS | PyBUF_STRIDES | PyBUF_ND | PyBUF_FORMAT).
+const PY_BUF_C_CONTIGUOUS: std::ffi::c_int = 0x003C;
+
+/// Element types `RawBuffer` may be read as, keyed by struct-module format code.
+/// `item_count::<T>()` rejects buffers whose format or itemsize doesn't match,
+/// so a 7-byte `bytes` can never be reinterpreted as seven i64s.
+pub(super) trait BufElem {
+    const FORMATS: &'static [u8];
+    const NAME: &'static str;
+}
+impl BufElem for f64 {
+    const FORMATS: &'static [u8] = b"d";
+    const NAME: &'static str = "float64";
+}
+impl BufElem for f32 {
+    const FORMATS: &'static [u8] = b"f";
+    const NAME: &'static str = "float32";
+}
+impl BufElem for i64 {
+    // numpy int64 exports 'l' on LP64; Arrow/memoryview casts use 'q'.
+    // The itemsize check rejects 'l' where long is 4 bytes (Windows).
+    const FORMATS: &'static [u8] = b"qln";
+    const NAME: &'static str = "int64";
+}
+impl BufElem for u8 {
+    const FORMATS: &'static [u8] = b"B";
+    const NAME: &'static str = "uint8";
+}
 
 extern "C" {
     fn PyObject_GetBuffer(
@@ -74,12 +101,33 @@ impl RawBuffer {
         })
     }
 
-    /// Number of logical elements (len_bytes / itemsize).
-    pub(super) fn item_count(&self) -> usize {
-        if self.view.itemsize <= 0 {
-            return 0;
+    /// Number of `T` elements (len_bytes / itemsize), after checking that the
+    /// buffer's format code and itemsize actually describe `T`.
+    pub(super) fn item_count<T: BufElem>(&self) -> PyResult<usize> {
+        // A NULL format means unsigned bytes ("B") per the buffer protocol.
+        let fmt: &[u8] = if self.view.format.is_null() {
+            b"B"
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(self.view.format) }.to_bytes()
+        };
+        // Accept native byte order markers; '<' only on little-endian hosts.
+        let code = match fmt {
+            [b'@' | b'=', c] => Some(*c),
+            [b'<', c] if cfg!(target_endian = "little") => Some(*c),
+            [c] => Some(*c),
+            _ => None,
+        };
+        let matches = code.is_some_and(|c| T::FORMATS.contains(&c))
+            && self.view.itemsize as usize == std::mem::size_of::<T>();
+        if !matches {
+            return Err(PyValueError::new_err(format!(
+                "expected a {} buffer, got format '{}' with itemsize {}",
+                T::NAME,
+                String::from_utf8_lossy(fmt),
+                self.view.itemsize
+            )));
         }
-        (self.view.len as usize) / (self.view.itemsize as usize)
+        Ok((self.view.len as usize) / std::mem::size_of::<T>())
     }
 
     /// Number of dimensions (1 for a 1-D array).
@@ -305,7 +353,6 @@ pub(super) fn max_lazy_float_list(
     stats_lazy_float_list(list_ptr, ops, skip, take).map(|(_, _, _, max)| max)
 }
 
-
 /// Execute a LazyFloatList pipeline.
 ///
 /// Decision rule:
@@ -402,7 +449,7 @@ pub(super) fn filter_by_field(
         .bind(py)
         .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjField source must be a list"))?;
-    let list_ptr = list.as_ptr();
+
     let n = list.len();
 
     let key = pyo3::types::PyString::new(py, field_name);
@@ -410,7 +457,9 @@ pub(super) fn filter_by_field(
 
     let mut values: Vec<f64> = Vec::with_capacity(n);
     for i in 0..n {
-        let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
+        // Owned ref: user __eq__ may run below and shrink the list.
+        let held = list.get_item(i).ok();
+        let item_ptr = held.as_ref().map_or(std::ptr::null_mut(), |h| h.as_ptr());
         let f = if !item_ptr.is_null() && unsafe { ffi::PyDict_Check(item_ptr) } != 0 {
             let val_ptr = unsafe { ffi::PyDict_GetItemWithError(item_ptr, key_ptr) };
             if val_ptr.is_null() {
@@ -464,11 +513,11 @@ pub(super) fn filter_by_field(
 
     let mut result: Vec<Py<PyAny>> = Vec::with_capacity(indices.len());
     for &i in &indices {
-        let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
-        unsafe {
-            ffi::Py_INCREF(item_ptr);
+        // The list may have shrunk during the extraction pass (user __eq__);
+        // indices past the new end are dropped rather than read as NULL.
+        if let Ok(item) = list.get_item(i) {
+            result.push(item.unbind());
         }
-        result.push(unsafe { Bound::from_owned_ptr(py, item_ptr).unbind() });
     }
     Ok(result)
 }
@@ -486,13 +535,12 @@ pub(super) fn sum_field_by_field(
     skip: usize,
     take: Option<usize>,
 ) -> PyResult<f64> {
-    use pyo3::ffi;
 
     let list = source
         .bind(py)
         .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjField source must be a list"))?;
-    let list_ptr = list.as_ptr();
+
     let n = list.len();
 
     let same_field = filter_field == sum_field;
@@ -510,7 +558,9 @@ pub(super) fn sum_field_by_field(
     if same_field {
         // Single extraction pass — filter_vals doubles as sum_vals
         for i in 0..n {
-            let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
+            // Owned ref: user __eq__ may run below and shrink the list.
+            let held = list.get_item(i).ok();
+            let item_ptr = held.as_ref().map_or(std::ptr::null_mut(), |h| h.as_ptr());
             let f = unsafe { extract_f64_from_dict_item(item_ptr, fkey_ptr) };
             filter_vals.push(f);
         }
@@ -518,7 +568,9 @@ pub(super) fn sum_field_by_field(
         let skey = pyo3::types::PyString::new(py, sum_field);
         let skey_ptr = skey.as_ptr();
         for i in 0..n {
-            let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
+            // Owned ref: user __eq__ may run below and shrink the list.
+            let held = list.get_item(i).ok();
+            let item_ptr = held.as_ref().map_or(std::ptr::null_mut(), |h| h.as_ptr());
             filter_vals.push(unsafe { extract_f64_from_dict_item(item_ptr, fkey_ptr) });
             sum_vals.push(unsafe { extract_f64_from_dict_item(item_ptr, skey_ptr) });
         }
@@ -695,7 +747,7 @@ pub(super) fn filter_by_field_py(
         .bind(py)
         .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjFieldPy source must be a list"))?;
-    let list_ptr = list.as_ptr();
+
     let n = list.len();
 
     let prepared = precompile_obj_field_ops(py, ops)?;
@@ -706,7 +758,9 @@ pub(super) fn filter_by_field_py(
     let mut skipped = 0usize;
 
     'outer: for i in 0..n {
-        let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
+        // Owned ref: user __eq__ may run below and shrink the list.
+        let held = list.get_item(i).ok();
+        let item_ptr = held.as_ref().map_or(std::ptr::null_mut(), |h| h.as_ptr());
         if item_ptr.is_null() {
             continue;
         }
@@ -722,7 +776,17 @@ pub(super) fn filter_by_field_py(
                 }
                 return !op.is_eq;
             }
-            let cmp = unsafe { ffi::PyObject_RichCompareBool(val, op.target.as_ptr(), ffi::Py_EQ) };
+            // Hold `val` across the compare (a user __eq__ may mutate the dict and drop it)
+            // and clear any exception it raised, matching the NaN-on-error policy above.
+            let cmp = unsafe {
+                ffi::Py_INCREF(val);
+                let r = ffi::PyObject_RichCompareBool(val, op.target.as_ptr(), ffi::Py_EQ);
+                ffi::Py_DECREF(val);
+                if r < 0 {
+                    ffi::PyErr_Clear();
+                }
+                r
+            };
             if op.is_eq {
                 cmp == 1
             } else {
@@ -780,7 +844,7 @@ pub(super) fn count_by_field_py(
         .bind(py)
         .cast::<PyList>()
         .map_err(|_| PyValueError::new_err("ObjFieldPy source must be a list"))?;
-    let list_ptr = list.as_ptr();
+
     let n = list.len();
 
     let prepared = precompile_obj_field_ops(py, ops)?;
@@ -789,7 +853,9 @@ pub(super) fn count_by_field_py(
     let mut skipped = 0usize;
 
     for i in 0..n {
-        let item_ptr = unsafe { ffi::PyList_GetItem(list_ptr, i as isize) };
+        // Owned ref: user __eq__ may run below and shrink the list.
+        let held = list.get_item(i).ok();
+        let item_ptr = held.as_ref().map_or(std::ptr::null_mut(), |h| h.as_ptr());
         if item_ptr.is_null() {
             continue;
         }
@@ -805,7 +871,17 @@ pub(super) fn count_by_field_py(
                 }
                 return !op.is_eq;
             }
-            let cmp = unsafe { ffi::PyObject_RichCompareBool(val, op.target.as_ptr(), ffi::Py_EQ) };
+            // Hold `val` across the compare (a user __eq__ may mutate the dict and drop it)
+            // and clear any exception it raised, matching the NaN-on-error policy above.
+            let cmp = unsafe {
+                ffi::Py_INCREF(val);
+                let r = ffi::PyObject_RichCompareBool(val, op.target.as_ptr(), ffi::Py_EQ);
+                ffi::Py_DECREF(val);
+                if r < 0 {
+                    ffi::PyErr_Clear();
+                }
+                r
+            };
             if op.is_eq {
                 cmp == 1
             } else {
@@ -839,7 +915,7 @@ pub(super) fn execute_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Vec<f64>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -856,7 +932,7 @@ pub(super) fn count_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<usize> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -973,7 +1049,7 @@ pub(super) fn sum_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<f64> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -997,7 +1073,7 @@ pub(super) fn mean_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Option<f64>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -1020,7 +1096,7 @@ pub(super) fn var_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Option<f64>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -1037,7 +1113,7 @@ pub(super) fn min_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Option<f64>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -1054,7 +1130,7 @@ pub(super) fn max_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Option<f64>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -1071,7 +1147,7 @@ pub(super) fn stats_numpy_f64(
     take: Option<usize>,
 ) -> PyResult<Option<(usize, f64, f64, f64)>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f64>()?;
     let ptr = buf.buf_ptr::<f64>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f64, n);
@@ -1105,7 +1181,7 @@ pub(super) fn execute_numpy_f32(
     take: Option<usize>,
 ) -> PyResult<Vec<f32>> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f32>()?;
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);
@@ -1123,7 +1199,7 @@ pub(super) fn count_numpy_f32(
     take: Option<usize>,
 ) -> PyResult<usize> {
     let buf = unsafe { RawBuffer::get(py, source.bind(py).as_ptr()) }?;
-    let n = buf.item_count();
+    let n = buf.item_count::<f32>()?;
     let ptr = buf.buf_ptr::<f32>() as usize;
     let result = py.detach(|| unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const f32, n);

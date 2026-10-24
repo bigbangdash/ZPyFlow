@@ -109,6 +109,8 @@ impl PyQuery {
         if buf.ndim() != 1 {
             return Err(PyValueError::new_err("_from_buffer_f64: expected 1-D array"));
         }
+        // Reject non-float64 buffers up front; execution re-checks on each read.
+        buf.item_count::<f64>()?;
         // C-contiguity is guaranteed by PyBUF_C_CONTIGUOUS; buf dropped here.
         Ok(PyQuery::from_inner(QueryInner::NumpyF64 {
             source: obj.clone().unbind(),
@@ -123,7 +125,7 @@ impl PyQuery {
         if buf.ndim() != 1 {
             return Err(PyValueError::new_err("_from_buffer_i64: expected 1-D array"));
         }
-        let n = buf.item_count();
+        let n = buf.item_count::<i64>()?;
         let src = buf.buf_ptr::<i64>() as usize;
         let mut data = vec![0i64; n];
         let dst = data.as_mut_ptr() as usize;
@@ -140,7 +142,8 @@ impl PyQuery {
         if buf.ndim() != 1 {
             return Err(PyValueError::new_err("_from_buffer_f32: expected 1-D array"));
         }
-        let _ = py;
+        // Reject non-float32 buffers up front; execution re-checks on each read.
+        buf.item_count::<f32>()?;
         Ok(PyQuery::from_inner(QueryInner::NumpyF32 {
             source: obj.clone().unbind(),
             ops: Vec::new(),
@@ -154,7 +157,7 @@ impl PyQuery {
         if buf.ndim() != 1 {
             return Err(PyValueError::new_err("_from_buffer_u8: expected 1-D array"));
         }
-        let n = buf.item_count();
+        let n = buf.item_count::<u8>()?;
         let src = buf.buf_ptr::<u8>() as usize;
         let mut data = vec![0u8; n];
         let dst = data.as_mut_ptr() as usize;

@@ -715,3 +715,61 @@ class TestColumnarObjArrow:
         pytest.importorskip("pyarrow")
         df = Query(self.LOGS).preload().filter(field("score") > 0.5).to_pandas()
         assert len(df) == 2
+
+
+class TestBufferTypeChecks:
+    """_from_buffer_* must reject buffers whose format/itemsize don't match."""
+
+    @pytest.mark.parametrize("ctor", ["_from_buffer_i64", "_from_buffer_f64", "_from_buffer_f32"])
+    def test_rejects_byte_buffer(self, ctor):
+        # 7 bytes used to be read as 7 x 8-byte elements (out-of-bounds read).
+        with pytest.raises(ValueError, match="buffer"):
+            getattr(Query, ctor)(b"\x01" * 7)
+
+    def test_u8_rejects_float_buffer(self):
+        import array
+
+        with pytest.raises(ValueError, match="uint8"):
+            Query._from_buffer_u8(array.array("d", [1.0]))
+
+    def test_accepts_matching_buffers(self):
+        import array
+
+        assert Query._from_buffer_i64(array.array("q", [1, 2])).to_list() == [1, 2]
+        assert Query._from_buffer_f64(array.array("d", [1.5])).to_list() == [1.5]
+        assert Query._from_buffer_u8(b"\x01\x02").to_list() == [1, 2]
+
+    def test_numpy_int64_native_format(self):
+        np = pytest.importorskip("numpy")
+        # numpy exports int64 as 'l' on LP64 platforms.
+        assert Query._from_buffer_i64(np.arange(3, dtype=np.int64)).to_list() == [0, 1, 2]
+
+
+class TestListMutationDuringScan:
+    """User __eq__ running inside dict lookups must not crash the field fast paths."""
+
+    @staticmethod
+    def _make_data(n=10):
+        data = []
+
+        class Shrinker:
+            def __hash__(self):
+                return hash("k")  # collide with the "k" key so __eq__ runs
+
+            def __eq__(self, other):
+                data.clear()
+                return False
+
+        data.append({Shrinker(): 1, "k": 5.0})
+        data.extend({"k": 5.0} for _ in range(n))
+        return data
+
+    def test_numeric_field_filter(self):
+        Query(self._make_data()).filter(field("k") > 0).to_list()
+
+    def test_numeric_field_filter_sum(self):
+        Query(self._make_data()).filter(field("k") > 0).sum_field("k")
+
+    def test_eq_field_filter(self):
+        Query(self._make_data()).filter(field("k") == 5.0).to_list()
+        Query(self._make_data()).filter(field("k") == 5.0).count()
