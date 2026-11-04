@@ -18,7 +18,7 @@
 PYTHON ?= python3
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-full build-debug test test-fast bench bench-rust lint fmt audit clean \
+.PHONY: help build build-full build-debug test test-fast bench bench-rust lint fmt audit clean metrics progress \
         docs docs-serve docs-deploy \
         bench-threading bench-multiprocess bench-fastapi \
         dc-build dc-test dc-bench dc-bench-rust dc-shell dc-clean \
@@ -199,3 +199,10 @@ dc-clean:  ## [Docker] Remove named volumes (reset Cargo and target cache)
 
 dc-ps:  ## [Docker] Show running containers
 	docker compose ps
+
+metrics:  ## Build with alloc counter and check metrics against baseline (see CLAUDE.md)
+	maturin develop --profile dev-release --features "alloc-stats pyo3/extension-module"
+	$(PYTHON) scripts/metrics.py --check
+
+progress:  ## Scoreboard vs metrics/targets.json 'good enough' lines (run after make metrics)
+	$(PYTHON) scripts/progress.py

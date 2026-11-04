@@ -1,0 +1,122 @@
+{
+ "f64.filter.count": {
+  "rust_allocs": 9,
+  "rust_bytes": 32920,
+  "rust_peak": 32864,
+  "py_peak": 272,
+  "wall_us": 4491.1,
+  "cpu_us": 4486.0
+ },
+ "f64.filter.sum": {
+  "rust_allocs": 7,
+  "rust_bytes": 144,
+  "rust_peak": 104,
+  "py_peak": 272,
+  "wall_us": 9010.6,
+  "cpu_us": 9012.0
+ },
+ "f64.filter.max": {
+  "rust_allocs": 7,
+  "rust_bytes": 144,
+  "rust_peak": 104,
+  "py_peak": 272,
+  "wall_us": 9021.3,
+  "cpu_us": 9022.0
+ },
+ "f64.filter.std": {
+  "rust_allocs": 7,
+  "rust_bytes": 144,
+  "rust_peak": 104,
+  "py_peak": 272,
+  "wall_us": 17755.7,
+  "cpu_us": 17756.0
+ },
+ "f64.between.stats": {
+  "rust_allocs": 7,
+  "rust_bytes": 144,
+  "rust_peak": 104,
+  "py_peak": 363,
+  "wall_us": 8067.7,
+  "cpu_us": 8068.0
+ },
+ "f64.filter.to_list": {
+  "rust_allocs": 10,
+  "rust_bytes": 12000152,
+  "rust_peak": 12000096,
+  "py_peak": 15987992,
+  "wall_us": 15130.3,
+  "cpu_us": 15127.0
+ },
+ "f64.chain4.to_list": {
+  "rust_allocs": 34,
+  "rust_bytes": 17997128,
+  "rust_peak": 15997760,
+  "py_peak": 15987992,
+  "wall_us": 15733.8,
+  "cpu_us": 15682.0
+ },
+ "f64.take10.to_list": {
+  "rust_allocs": 14,
+  "rust_bytes": 49424,
+  "rust_peak": 49256,
+  "py_peak": 392,
+  "wall_us": 21.8,
+  "cpu_us": 22.0
+ },
+ "np.filter.sum": {
+  "rust_allocs": 8,
+  "rust_bytes": 152,
+  "rust_peak": 104,
+  "py_peak": 272,
+  "wall_us": 221.6,
+  "cpu_us": 223.0
+ },
+ "f64.lambda.count": {
+  "rust_allocs": 15,
+  "rust_bytes": 33040,
+  "rust_peak": 32864,
+  "py_peak": 27057,
+  "wall_us": 4612.6,
+  "cpu_us": 4612.0
+ },
+ "null.lambda.count": {
+  "rust_allocs": 8,
+  "rust_bytes": 16000128,
+  "rust_peak": 8000000,
+  "py_peak": 888,
+  "wall_us": 45428.5,
+  "cpu_us": 45370.0
+ },
+ "dict.field.count": {
+  "rust_allocs": 12,
+  "rust_bytes": 800136,
+  "rust_peak": 800072,
+  "py_peak": 312,
+  "wall_us": 1677.2,
+  "cpu_us": 1677.0
+ },
+ "dict.field.to_list": {
+  "rust_allocs": 26,
+  "rust_bytes": 1175704,
+  "rust_peak": 1044576,
+  "py_peak": 113768,
+  "wall_us": 1471.0,
+  "cpu_us": 1472.0
+ },
+ "dict.preloaded.count": {
+  "rust_allocs": 23,
+  "rust_bytes": 262392,
+  "rust_peak": 131288,
+  "py_peak": 220,
+  "wall_us": 1355.3,
+  "cpu_us": 1356.0
+ },
+ "dict.groupby.count": {
+  "rust_allocs": 1,
+  "rust_bytes": 8,
+  "rust_peak": 8,
+  "py_peak": 837692,
+  "wall_us": 4661.2,
+  "cpu_us": 4662.0
+ }
+}

@@ -1,0 +1,21 @@
+{
+ "_comment": "Human-owned 'good enough' lines (decided by the user 2026-11-05). A case that meets its line is DONE: do not polish it further until every case is done. Time and peaks: not regressing vs baseline is enough (enforced by metrics.py --check), so they are never a goal on their own.",
+ "aggregate": {
+  "cases": [
+   "f64.filter.count", "f64.filter.sum", "f64.filter.max", "f64.filter.std",
+   "f64.between.stats", "np.filter.sum", "f64.lambda.count", "null.lambda.count",
+   "dict.field.count", "dict.preloaded.count", "dict.groupby.count"
+  ],
+  "rust_allocs": 0
+ },
+ "to_list": {
+  "cases": {
+   "f64.filter.to_list": 8,
+   "f64.chain4.to_list": 8,
+   "f64.take10.to_list": 8,
+   "dict.field.to_list": 16
+  },
+  "_comment": "value = bytes per output item; line is rust_bytes <= len(output) * value * slack",
+  "slack": 1.1
+ }
+}
