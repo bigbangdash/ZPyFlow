@@ -76,4 +76,5 @@ auto-save-list
 
 # scripts/metrics.py output (baseline.json is tracked)
 metrics/current.json
+metrics/.progress_prev.json
 .venv/
