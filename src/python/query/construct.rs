@@ -75,6 +75,15 @@ impl PyQuery {
                     return Ok(PyQuery::from_inner(QueryInner::I64(IntPipeline::new(v))));
                 }
             }
+            // Whole-list extraction pre-allocates len() slots before it reaches a bad
+            // element. If the first element cannot convert (e.g. None in a nullable
+            // column), the whole list cannot either — skip straight to the Obj path.
+            if first.extract::<f64>().is_err() && first.extract::<i64>().is_err() {
+                return Ok(PyQuery::from_inner(QueryInner::Obj {
+                    source: data.unbind(),
+                    ops: Vec::new(),
+                }));
+            }
         }
         // Non-list typed extraction (numpy arrays, tuples, etc.)
         if let Ok(v) = data.extract::<Vec<f64>>() {
