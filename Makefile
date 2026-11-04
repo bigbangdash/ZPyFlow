@@ -199,3 +199,7 @@ dc-clean:  ## [Docker] Remove named volumes (reset Cargo and target cache)
 
 dc-ps:  ## [Docker] Show running containers
 	docker compose ps
+
+metrics:  ## Build with alloc counter and check metrics against baseline (see CLAUDE.md)
+	maturin develop --profile dev-release --features "alloc-stats pyo3/extension-module"
+	$(PYTHON) scripts/metrics.py --check

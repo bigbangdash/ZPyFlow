@@ -17,7 +17,8 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 simd    = []       # Requires nightly (portable_simd); stable uses wide
 arrow   = []  # reserved feature flag — arrow2 removed (RUSTSEC-2025-0038, no fix available)
-extension-module = ["pyo3/extension-module"]  # enabled by maturin via pyproject.toml; absent for cargo test
+extension-module = ["pyo3/extension-module"]
+alloc-stats = []  # counting global allocator for scripts/metrics.py (measurement builds only)  # enabled by maturin via pyproject.toml; absent for cargo test
 
 [dependencies]
 pyo3        = { version = "0.21", features = ["abi3-py310", "multiple-pymethods"] }

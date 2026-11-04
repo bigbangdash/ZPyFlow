@@ -73,3 +73,7 @@ auto-save-list
 .vscode/
 *.swp
 *.swo
+
+# scripts/metrics.py output (baseline.json is tracked)
+metrics/current.json
+.venv/
